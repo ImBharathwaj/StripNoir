@@ -1,0 +1,133 @@
+services:
+  api:
+    image: node:20-alpine
+    container_name: stripnoir-api
+    working_dir: /app
+    command: >
+      sh -lc "if [ -f package.json ]; then
+        npm install && npm run dev;
+      else
+        echo 'services/api not initialized yet. Add Node API code to services/api';
+        tail -f /dev/null;
+      fi"
+    volumes:
+      - ../services/api:/app
+    ports:
+      - "${API_PORT:-13000}:3000"
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/${POSTGRES_DB:-stripnoir}
+      REDIS_URL: redis://redis:6379
+      CHAT_SERVICE_URL: http://chat:8080
+      CHAT_INTERNAL_API_KEY: ${CHAT_INTERNAL_API_KEY:-}
+      JWT_SECRET: ${JWT_SECRET:-dev_jwt_secret}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-dev_access_secret}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-dev_refresh_secret}
+      JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-15m}
+      JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-30d}
+      LIVEKIT_URL: ${LIVEKIT_URL:-wss://your-project.livekit.cloud}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-replace_me}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-replace_me}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      chat:
+        condition: service_started
+    networks:
+      - stripnoir
+
+  chat:
+    image: golang:1.22
+    container_name: stripnoir-chat
+    working_dir: /app
+    command: >
+      sh -lc "if [ -f go.mod ]; then
+        /usr/local/go/bin/go mod download && /usr/local/go/bin/go run ./cmd/main.go;
+      else
+        echo 'services/chat not initialized yet. Add Go realtime code to services/chat';
+        tail -f /dev/null;
+      fi"
+    volumes:
+      - ../services/chat:/app
+    ports:
+      - "${CHAT_PORT:-18080}:8080"
+    environment:
+      GO_ENV: development
+      PORT: 8080
+      REDIS_URL: redis://redis:6379
+      CHAT_INTERNAL_API_KEY: ${CHAT_INTERNAL_API_KEY:-}
+      JWT_SECRET: ${JWT_SECRET:-dev_jwt_secret}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-dev_access_secret}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/${POSTGRES_DB:-stripnoir}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - stripnoir
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: stripnoir-postgres
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_PORT:-15432}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
+      POSTGRES_DB: ${POSTGRES_DB:-stripnoir}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-app} -d ${POSTGRES_DB:-stripnoir}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - stripnoir
+
+  redis:
+    image: redis:7-alpine
+    container_name: stripnoir-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-16379}:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - stripnoir
+
+  minio:
+    image: minio/minio:latest
+    container_name: stripnoir-minio
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    ports:
+      - "${MINIO_PORT:-19000}:9000"
+      - "${MINIO_CONSOLE_PORT:-19001}:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio123}
+    volumes:
+      - miniodata:/data
+    networks:
+      - stripnoir
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
+
+networks:
+  stripnoir:
+    driver: bridge
