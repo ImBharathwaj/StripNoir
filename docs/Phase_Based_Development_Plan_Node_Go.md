@@ -64,18 +64,20 @@ Status legend:
 **Objective:** Lock architecture boundaries before feature coding.
 
 - [x] Finalize service boundaries: Node API vs Go realtime
-- [ ] Create `shared-contracts/openapi.yaml` for all external APIs
-- [ ] Define internal contracts:
+- [x] Create `shared-contracts/openapi.yaml` for all external APIs
+- [x] Define internal contracts:
   - [x] Node -> Go: token verify, room publish
-  - [ ] Node -> Go: explicit room create/join internal contracts
-  - [ ] Go -> Node/internal: auth lookup, moderation hooks, ledger hooks
+  - [x] Node -> Go: explicit room create/join internal contracts
+  - [x] Go -> Node/internal: auth lookup, moderation hooks, ledger hooks
 - [x] Set up environments and secrets (`LIVEKIT_*`, JWT secrets, Redis/Postgres)
-- [ ] Local infra with Docker Compose (Node, Go, Redis, Postgres, PgBouncer)
+- [x] Local infra with Docker Compose (Node, Go, Redis, Postgres, PgBouncer)
+  - [x] Custom PgBouncer container added under `infra/pgbouncer`
+  - [x] Node API and Go chat `DATABASE_URL` route through PgBouncer (`pgbouncer:6432`)
 
 **Exit criteria**
-- [ ] Both services boot locally (not verified in this update)
-- [ ] API contract versioning policy agreed
-- [ ] CI checks for contract/schema changes
+- [x] Both services boot locally
+- [x] API contract versioning policy agreed
+- [x] CI checks for contract/schema changes
 
 ## Phase 1: Node.js Core MVP Modules
 **Objective:** Ship basic product flows quickly in Node.
@@ -93,7 +95,7 @@ Data model setup:
 - [x] Wallet/CreditTransaction, Payouts
 
 **Exit criteria**
-- [ ] End-to-end flow works: user signup -> follow -> subscribe -> consume content -> tip (in progress)
+- [x] End-to-end flow works: user signup -> follow -> subscribe -> consume content -> tip
 - [ ] Basic rate limits at gateway for all public endpoints
 
 ## Phase 2: Realtime Baseline (Node Orchestration + Go WS)
@@ -118,10 +120,16 @@ Data model setup:
 **Objective:** Deliver live and private video features with controlled billing logic.
 
 Node responsibilities:
-- [ ] Live session APIs (`/streams/start|join|end|live|:id`) (`/streams/live` stub exists)
+- [x] Live session APIs (`/streams/start|join|end|live|:id`)
+  - [x] Creator start/end flows persist `live_session` + backing `chat_room`
+  - [x] Public live list/detail endpoints backed by PostgreSQL
+  - [x] Viewer join flow records `live_session_viewer` access and initial join billing
+  - [x] End-to-end validator added at `scripts/check_live_session_flow.sh`
 - [ ] Video call APIs (`/calls/create|join|end`, request/accept/decline flows)
 - [ ] Credit deduction/earning ledger for join/extend/tips
-- [ ] LiveKit token issuance and role-based grants
+- [x] LiveKit token issuance and role-based grants
+  - [x] Host/viewer LiveKit access tokens issued from Node for active live sessions
+  - [x] Role grants enforced in API responses and `POST /api/v1/streams/:id/token`
 
 Go responsibilities:
 - [ ] Realtime live chat fan-out for stream rooms
@@ -230,6 +238,7 @@ Use `infra/docker-compose.yml` for local portable development with non-native ho
 - Node API: `13000 -> 3000`
 - Go Chat WS/API: `18080 -> 8080`
 - PostgreSQL: `15432 -> 5432`
+- PgBouncer: `16432 -> 6432`
 - Redis: `16379 -> 6379`
 - MinIO API: `19000 -> 9000`
 - MinIO Console: `19001 -> 9001`
@@ -237,6 +246,7 @@ Use `infra/docker-compose.yml` for local portable development with non-native ho
 ### Files
 - Compose: `infra/docker-compose.yml`
 - Env template: `infra/.env.example`
+- PgBouncer image/entrypoint: `infra/pgbouncer/Dockerfile`, `infra/pgbouncer/entrypoint.sh`
 
 ### Run
 ```bash
@@ -253,5 +263,7 @@ docker compose down
 
 ### Notes
 - Container-to-container traffic still uses native internal ports (3000/8080/5432/6379).
+- Node API and Go chat connect to Postgres through PgBouncer on the internal compose network (`pgbouncer:6432`).
+- PgBouncer is exposed on host port `16432` for direct local verification and troubleshooting.
 - You can change only host ports in `infra/.env` if any conflict remains.
 - `services/api` and `services/chat` are bind-mounted; when code is missing, containers stay alive with a placeholder message.
