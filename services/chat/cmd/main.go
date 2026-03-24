@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,14 +44,15 @@ type publishRequest struct {
 }
 
 type chatEvent struct {
-	RoomID    string          `json:"roomId"`
+	RoomID    string          `json:"roomId,omitempty"`
+	UserID    string          `json:"userId,omitempty"`
 	EventType string          `json:"eventType"`
 	Payload   json.RawMessage `json:"payload"`
 	SentAt    time.Time       `json:"sentAt"`
 }
 
-type chatTokenClaims struct {
-	RoomID string `json:"roomId"`
+type realtimeTokenClaims struct {
+	RoomID string `json:"roomId,omitempty"`
 	Typ    string `json:"typ"`
 	jwt.RegisteredClaims
 }
@@ -62,6 +65,46 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 
 func redisChannelForRoom(roomID string) string {
 	return "room:" + roomID
+}
+
+func redisChannelForUserNotify(userID string) string {
+	return "user_notify:" + userID
+}
+
+func redisWSPresenceSetKey(roomID string) string {
+	return "presence:ws:" + roomID
+}
+
+func newConnID() string {
+	buf := make([]byte, 16)
+	_, _ = rand.Read(buf)
+	return hex.EncodeToString(buf)
+}
+
+func publishPresenceEvent(ctx context.Context, redisClient *redis.Client, roomID string) error {
+	n, err := redisClient.SCard(ctx, redisWSPresenceSetKey(roomID)).Result()
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(map[string]any{
+		"roomId":         roomID,
+		"wsViewerCount":  n,
+		"presenceSource": "chat_ws",
+	})
+	if err != nil {
+		return err
+	}
+	event := chatEvent{
+		RoomID:    roomID,
+		EventType: "live.ws_presence",
+		Payload:   json.RawMessage(payload),
+		SentAt:    time.Now().UTC(),
+	}
+	raw, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	return redisClient.Publish(ctx, redisChannelForRoom(roomID), raw).Err()
 }
 
 func healthHandler(port string) http.HandlerFunc {
@@ -134,7 +177,7 @@ func extractBearerToken(r *http.Request) string {
 	return ""
 }
 
-func validateChatToken(tokenString string, jwtSecrets []string, expectedRoomID string) (*chatTokenClaims, error) {
+func parseRealtimeToken(tokenString string, jwtSecrets []string, roomIDFromQuery string) (*realtimeTokenClaims, error) {
 	if tokenString == "" {
 		return nil, errors.New("token is required")
 	}
@@ -145,7 +188,7 @@ func validateChatToken(tokenString string, jwtSecrets []string, expectedRoomID s
 			continue
 		}
 
-		claims := &chatTokenClaims{}
+		claims := &realtimeTokenClaims{}
 		token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (any, error) {
 			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
@@ -157,20 +200,26 @@ func validateChatToken(tokenString string, jwtSecrets []string, expectedRoomID s
 			continue
 		}
 
-		if claims.Typ != "chat" {
+		switch strings.TrimSpace(claims.Typ) {
+		case "chat":
+			if claims.Subject == "" {
+				return nil, errors.New("token subject missing")
+			}
+			if strings.TrimSpace(claims.RoomID) == "" {
+				return nil, errors.New("token roomId missing")
+			}
+			if roomIDFromQuery != "" && claims.RoomID != roomIDFromQuery {
+				return nil, errors.New("token room mismatch")
+			}
+			return claims, nil
+		case "notify":
+			if claims.Subject == "" {
+				return nil, errors.New("token subject missing")
+			}
+			return claims, nil
+		default:
 			return nil, errors.New("invalid token type")
 		}
-		if claims.Subject == "" {
-			return nil, errors.New("token subject missing")
-		}
-		if claims.RoomID == "" {
-			return nil, errors.New("token roomId missing")
-		}
-		if expectedRoomID != "" && claims.RoomID != expectedRoomID {
-			return nil, errors.New("token room mismatch")
-		}
-
-		return claims, nil
 	}
 
 	if lastErr != nil {
@@ -232,6 +281,65 @@ func publishHandler(redisClient *redis.Client, internalKey string) http.HandlerF
 	}
 }
 
+type notifyPublishRequest struct {
+	UserID    string          `json:"userId"`
+	EventType string          `json:"eventType"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
+func notifyPublishHandler(redisClient *redis.Client, internalKey string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+
+		if internalKey != "" && r.Header.Get("x-internal-key") != internalKey {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized internal publish"})
+			return
+		}
+
+		var req notifyPublishRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		if strings.TrimSpace(req.UserID) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "userId is required"})
+			return
+		}
+		if strings.TrimSpace(req.EventType) == "" {
+			req.EventType = "notification.created"
+		}
+		if len(req.Payload) == 0 {
+			req.Payload = json.RawMessage(`{}`)
+		}
+
+		event := chatEvent{
+			UserID:    req.UserID,
+			EventType: req.EventType,
+			Payload:   req.Payload,
+			SentAt:    time.Now().UTC(),
+		}
+		raw, err := json.Marshal(event)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to marshal event"})
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		if err := redisClient.Publish(ctx, redisChannelForUserNotify(req.UserID), raw).Err(); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to publish event"})
+			return
+		}
+
+		writeJSON(w, http.StatusAccepted, map[string]string{
+			"status": "published",
+		})
+	}
+}
+
 func wsHandler(redisClient *redis.Client, jwtSecrets []string) http.HandlerFunc {
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024,
@@ -245,18 +353,26 @@ func wsHandler(redisClient *redis.Client, jwtSecrets []string) http.HandlerFunc 
 		token := r.URL.Query().Get("token")
 		requestedRoomID := strings.TrimSpace(r.URL.Query().Get("roomId"))
 
-		claims, err := validateChatToken(token, jwtSecrets, requestedRoomID)
+		claims, err := parseRealtimeToken(token, jwtSecrets, requestedRoomID)
 		if err != nil {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
 			return
 		}
-		roomID := claims.RoomID
 
+		if strings.TrimSpace(claims.Typ) == "notify" {
+			runNotifyWebSocket(w, r, redisClient, &upgrader, claims.Subject)
+			return
+		}
+
+		roomID := claims.RoomID
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
 		}
 		defer conn.Close()
+
+		connID := newConnID()
+		presenceKey := redisWSPresenceSetKey(roomID)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -264,6 +380,29 @@ func wsHandler(redisClient *redis.Client, jwtSecrets []string) http.HandlerFunc 
 		sub := redisClient.Subscribe(ctx, redisChannelForRoom(roomID))
 		defer sub.Close()
 		pubCh := sub.Channel()
+
+		regCtx, regCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if err := redisClient.SAdd(regCtx, presenceKey, connID).Err(); err == nil {
+			_ = redisClient.Expire(regCtx, presenceKey, 2*time.Hour).Err()
+			if err := publishPresenceEvent(regCtx, redisClient, roomID); err != nil {
+				log.Printf("presence publish (join): %v", err)
+			}
+		} else {
+			log.Printf("presence sadd: %v", err)
+		}
+		regCancel()
+
+		defer func() {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cleanupCancel()
+			if err := redisClient.SRem(cleanupCtx, presenceKey, connID).Err(); err != nil {
+				log.Printf("presence srem: %v", err)
+				return
+			}
+			if err := publishPresenceEvent(cleanupCtx, redisClient, roomID); err != nil {
+				log.Printf("presence publish (leave): %v", err)
+			}
+		}()
 
 		done := make(chan struct{})
 		go func() {
@@ -282,6 +421,40 @@ func wsHandler(redisClient *redis.Client, jwtSecrets []string) http.HandlerFunc 
 				<-done
 				return
 			}
+		}
+	}
+}
+
+func runNotifyWebSocket(w http.ResponseWriter, r *http.Request, redisClient *redis.Client, upgrader *websocket.Upgrader, userID string) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sub := redisClient.Subscribe(ctx, redisChannelForUserNotify(userID))
+	defer sub.Close()
+	pubCh := sub.Channel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for msg := range pubCh {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(msg.Payload)); err != nil {
+				return
+			}
+		}
+	}()
+
+	for {
+		_, _, err := conn.ReadMessage()
+		if err != nil {
+			cancel()
+			<-done
+			return
 		}
 	}
 }
@@ -307,7 +480,7 @@ func longPollEventsHandler(redisClient *redis.Client, jwtSecrets []string) http.
 		if token == "" {
 			token = extractBearerToken(r)
 		}
-		if _, err := validateChatToken(token, jwtSecrets, roomID); err != nil {
+		if _, err := parseRealtimeToken(token, jwtSecrets, roomID); err != nil {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
 			return
 		}
@@ -329,6 +502,65 @@ func longPollEventsHandler(redisClient *redis.Client, jwtSecrets []string) http.
 		defer cancel()
 
 		sub := redisClient.Subscribe(ctx, redisChannelForRoom(roomID))
+		defer sub.Close()
+		pubCh := sub.Channel()
+
+		select {
+		case <-ctx.Done():
+			writeJSON(w, http.StatusOK, map[string]any{
+				"events": []any{},
+			})
+		case msg := <-pubCh:
+			var event any
+			if err := json.Unmarshal([]byte(msg.Payload), &event); err != nil {
+				event = map[string]any{"raw": msg.Payload}
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"events": []any{event},
+			})
+		}
+	}
+}
+
+func notifyLongPollEventsHandler(redisClient *redis.Client, jwtSecrets []string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+
+		token := r.URL.Query().Get("token")
+		if token == "" {
+			token = extractBearerToken(r)
+		}
+		claims, err := parseRealtimeToken(token, jwtSecrets, "")
+		if err != nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+			return
+		}
+		if strings.TrimSpace(claims.Typ) != "notify" {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "notification token required"})
+			return
+		}
+		userID := claims.Subject
+
+		timeoutSec := 25
+		if rawTimeout := r.URL.Query().Get("timeoutSec"); rawTimeout != "" {
+			if n, err := strconv.Atoi(rawTimeout); err == nil {
+				if n < 1 {
+					n = 1
+				}
+				if n > 55 {
+					n = 55
+				}
+				timeoutSec = n
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutSec)*time.Second)
+		defer cancel()
+
+		sub := redisClient.Subscribe(ctx, redisChannelForUserNotify(userID))
 		defer sub.Close()
 		pubCh := sub.Channel()
 
@@ -379,11 +611,20 @@ func main() {
 	mux.HandleFunc("/health/deps", depsHealthHandler(databaseURL, redisClient))
 	mux.HandleFunc("/ws", wsHandler(redisClient, jwtSecrets))
 	mux.HandleFunc("/realtime/rooms/", longPollEventsHandler(redisClient, jwtSecrets))
+	mux.HandleFunc("/realtime/notify/events", notifyLongPollEventsHandler(redisClient, jwtSecrets))
 	mux.HandleFunc("/internal/chat/publish", publishHandler(redisClient, internalKey))
+	mux.HandleFunc("/internal/notify/publish", notifyPublishHandler(redisClient, internalKey))
+
+	mchat := newChatMetrics()
+	var handler http.Handler = mux
+	if metricsEnabledGo() {
+		mux.HandleFunc("/metrics", metricsHandler(mchat))
+		handler = withChatRequestMetrics(mchat, mux)
+	}
 
 	addr := ":" + port
 	log.Printf("chat service listening on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatal(err)
 	}
 }

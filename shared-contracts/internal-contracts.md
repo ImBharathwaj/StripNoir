@@ -35,6 +35,36 @@ Response:
   - `typ = "chat"`
   - `exp`
 
+### 1.3 Publish user notification event
+- Endpoint: `POST /internal/notify/publish` (Go chat service)
+- Auth: `x-internal-key` header (when `CHAT_INTERNAL_API_KEY` is configured)
+- Purpose: Fan-out per-user notification events through Redis pub/sub (`user_notify:{userId}`)
+
+Request body:
+```json
+{
+  "userId": "uuid",
+  "eventType": "notification.created",
+  "payload": {}
+}
+```
+
+Response:
+```json
+{
+  "status": "published"
+}
+```
+
+### 1.4 Notification stream token model
+- Issuer: Node API (`GET /api/v1/notifications/ws-token`)
+- Consumer: Go chat service (`/ws?token=...` and `GET /realtime/notify/events?token=...`)
+- JWT claims contract:
+  - `sub` (user id)
+  - `typ = "notify"`
+  - `exp`  
+  (no `roomId`)
+
 ## 2. Planned Go -> Node/internal hooks
 
 These are defined now for boundary clarity and can be implemented incrementally:

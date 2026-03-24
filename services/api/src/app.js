@@ -5,11 +5,20 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const { checkPostgres, closePostgres } = require('./infra/db');
-const { checkRedis, closeRedis } = require('./infra/redis');
+const { checkRedis, closeRedis, redisClient, ensureRedisConnected } = require('./infra/redis');
 const { pool } = require('./infra/db');
+const {
+  createMetricsMiddleware,
+  pollFallbackHintMiddleware,
+  metricsEnabled,
+  metricsSingleton
+} = require('./infra/httpMetrics');
 require('dotenv').config();
 
 const app = express();
+if (process.env.TRUST_PROXY === '1' || String(process.env.TRUST_PROXY).toLowerCase() === 'true') {
+  app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS || 1));
+}
 const port = Number(process.env.PORT || 3000);
 const accessTokenSecret = process.env.JWT_ACCESS_SECRET || process.env.JWT_SECRET || 'dev_jwt_secret';
 const refreshTokenSecret = process.env.JWT_REFRESH_SECRET || `${accessTokenSecret}_refresh`;
@@ -25,6 +34,17 @@ const livekitTokenTtlSeconds = Math.max(Number(process.env.LIVEKIT_TOKEN_TTL_SEC
 app.use(cors());
 app.use(express.json());
 app.use(morgan('dev'));
+app.use(createMetricsMiddleware(metricsSingleton));
+
+if (metricsEnabled()) {
+  app.get('/metrics', (req, res) => {
+    res.type('text/plain; version=0.0.4; charset=utf-8');
+    res.send(metricsSingleton.prometheusText());
+  });
+  app.get('/metrics.json', (req, res) => {
+    res.json(metricsSingleton.jsonSummary());
+  });
+}
 
 app.get('/health', (req, res) => {
   res.json({ service: 'api', status: 'ok', port });
@@ -45,6 +65,46 @@ app.get('/health/deps', async (req, res) => {
 });
 
 const v1 = express.Router();
+
+function createRedisFixedWindowLimiter({ prefix, windowSec, max }) {
+  const window = Math.max(1, Number(windowSec) || 60);
+  const limit = Math.max(1, Number(max) || 100);
+  return async function rateLimitMiddleware(req, res, next) {
+    const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+    const key = `${prefix}:${ip}`;
+    try {
+      await ensureRedisConnected();
+      const n = await redisClient.incr(key);
+      if (n === 1) {
+        await redisClient.expire(key, window);
+      }
+      const remaining = Math.max(0, limit - n);
+      res.setHeader('RateLimit-Limit', String(limit));
+      res.setHeader('RateLimit-Remaining', String(remaining));
+      if (n > limit) {
+        return res.status(429).json({ error: 'too many requests' });
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('rate limit redis error:', err.message);
+    }
+    return next();
+  };
+}
+
+const apiGeneralLimiter = createRedisFixedWindowLimiter({
+  prefix: 'rl:v1',
+  windowSec: process.env.API_RATE_LIMIT_WINDOW_SEC || 60,
+  max: process.env.API_RATE_LIMIT_MAX || 200
+});
+const apiAuthLimiterFlag = String(process.env.API_AUTH_RATE_LIMIT_ENABLED || 'true').toLowerCase() !== 'false';
+const apiAuthLimiter = createRedisFixedWindowLimiter({
+  prefix: 'rl:auth',
+  windowSec: process.env.API_AUTH_RATE_LIMIT_WINDOW_SEC || 900,
+  max: process.env.API_AUTH_RATE_LIMIT_MAX || 40
+});
+v1.use(apiGeneralLimiter);
+v1.use(pollFallbackHintMiddleware);
 
 function hashToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
@@ -100,6 +160,36 @@ function sanitizeContent(row) {
   };
 }
 
+function sanitizeSubscriptionExclusiveContent(row) {
+  return {
+    id: row.id,
+    creatorId: row.creator_id,
+    title: row.title,
+    caption: row.caption,
+    status: row.status,
+    publishedAt: row.published_at,
+    metadata: row.metadata,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function sanitizeNotificationRow(row) {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    type: row.type,
+    status: row.status,
+    title: row.title,
+    body: row.body,
+    deepLink: row.deep_link,
+    payload: row.payload,
+    createdAt: row.created_at,
+    readAt: row.read_at,
+    archivedAt: row.archived_at
+  };
+}
+
 function sanitizeLiveSession(row) {
   if (!row) {
     return null;
@@ -138,6 +228,39 @@ function sanitizeLiveSession(row) {
   };
 }
 
+function sanitizeVideoCallSession(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    id: row.id,
+    requestId: row.request_id,
+    clientUserId: row.client_user_id,
+    creatorId: row.creator_id,
+    creatorUserId: row.creator_user_id,
+    roomId: row.room_id,
+    livekitRoomName: row.livekit_room_name,
+    status: row.status,
+    startedAt: row.started_at,
+    endedAt: row.ended_at,
+    expiresAt: row.expires_at,
+    creditsPerBlock: row.credits_per_block,
+    blockDurationSeconds: row.block_duration_seconds,
+    totalBilledCredits: Number(row.total_billed_credits || 0),
+    metadata: row.metadata,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    creator: {
+      id: row.creator_id,
+      userId: row.creator_user_id,
+      stageName: row.stage_name,
+      username: row.username,
+      displayName: row.display_name
+    }
+  };
+}
+
 function getClientIp(req) {
   const xff = req.headers['x-forwarded-for'];
   if (typeof xff === 'string' && xff.length > 0) {
@@ -152,6 +275,20 @@ function parsePositiveInteger(input) {
     return null;
   }
   return value;
+}
+
+async function hasActiveSubscription(subscriberUserId, creatorId) {
+  const subscription = await pool.query(
+    `SELECT 1
+     FROM subscription
+     WHERE subscriber_user_id = $1
+       AND creator_id = $2
+       AND status = 'active'
+       AND (current_period_end IS NULL OR current_period_end > now())
+     LIMIT 1`,
+    [subscriberUserId, creatorId]
+  );
+  return subscription.rows.length > 0;
 }
 
 async function ensureWallet(client, userId) {
@@ -374,6 +511,29 @@ async function publishChatEvent(roomId, eventType, payload) {
   }
 }
 
+async function publishNotifyEvent(userId, eventType, payload) {
+  const body = {
+    userId,
+    eventType,
+    payload
+  };
+  const headers = {
+    'content-type': 'application/json'
+  };
+  if (chatInternalApiKey) {
+    headers['x-internal-key'] = chatInternalApiKey;
+  }
+  const response = await fetch(`${chatServiceUrl}/internal/notify/publish`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`notify publish failed: ${response.status} ${text}`);
+  }
+}
+
 async function getLiveSessionById(sessionId, viewerUserId = null, db = pool) {
   const result = await db.query(
     `SELECT ls.*,
@@ -473,6 +633,17 @@ function buildLiveKitGrant({ roomName, role }) {
   };
 }
 
+function buildVideoCallLiveKitGrant(roomName) {
+  return {
+    room: roomName,
+    roomJoin: true,
+    roomAdmin: false,
+    canPublish: true,
+    canPublishData: true,
+    canSubscribe: true
+  };
+}
+
 function issueLiveKitSessionCredentials({ stream, userId, role, displayName }) {
   const participantIdentity = `${role}:${userId}:${stream.id}`;
   const grant = buildLiveKitGrant({
@@ -504,6 +675,61 @@ function issueLiveKitSessionCredentials({ stream, userId, role, displayName }) {
   };
 }
 
+function issueVideoCallLiveKitCredentials({ call, userId, role, displayName }) {
+  const participantIdentity = `${role}:${userId}:${call.id}`;
+  const grant = buildVideoCallLiveKitGrant(call.livekitRoomName);
+  const token = createLiveKitAccessToken({
+    roomName: call.livekitRoomName,
+    identity: participantIdentity,
+    name: displayName || participantIdentity,
+    metadata: {
+      appUserId: userId,
+      videoCallSessionId: call.id,
+      roomId: call.roomId,
+      role
+    },
+    grant
+  });
+
+  return {
+    url: livekitUrl,
+    token,
+    roomName: call.livekitRoomName,
+    participantIdentity,
+    role,
+    grants: grant,
+    expiresInSeconds: livekitTokenTtlSeconds
+  };
+}
+
+async function getVideoCallSessionById(sessionId, db = pool) {
+  const result = await db.query(
+    `SELECT vcs.*,
+            cp.user_id AS creator_user_id,
+            cp.stage_name,
+            ua.username,
+            ua.display_name
+     FROM video_call_session vcs
+     INNER JOIN creator_profile cp
+       ON cp.id = vcs.creator_id
+     INNER JOIN user_account ua
+       ON ua.id = cp.user_id
+     WHERE vcs.id = $1
+     LIMIT 1`,
+    [sessionId]
+  );
+
+  if (result.rows.length === 0) {
+    return null;
+  }
+
+  const row = result.rows[0];
+  return {
+    call: sanitizeVideoCallSession(row),
+    raw: row
+  };
+}
+
 async function getCurrentUserProfile(userId, db = pool) {
   const result = await db.query(
     `SELECT id, email, username, display_name, status, created_at
@@ -515,7 +741,7 @@ async function getCurrentUserProfile(userId, db = pool) {
   return result.rows[0] || null;
 }
 
-v1.post('/auth/register', async (req, res) => {
+v1.post('/auth/register', ...(apiAuthLimiterFlag ? [apiAuthLimiter] : []), async (req, res) => {
   const { email, password, displayName, username } = req.body || {};
   if (!email || !password || !displayName) {
     return res.status(400).json({ error: 'email, password and displayName are required' });
@@ -560,7 +786,7 @@ v1.post('/auth/register', async (req, res) => {
   }
 });
 
-v1.post('/auth/login', async (req, res) => {
+v1.post('/auth/login', ...(apiAuthLimiterFlag ? [apiAuthLimiter] : []), async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) {
     return res.status(400).json({ error: 'email and password are required' });
@@ -621,7 +847,7 @@ v1.post('/auth/login', async (req, res) => {
   }
 });
 
-v1.post('/auth/refresh', async (req, res) => {
+v1.post('/auth/refresh', ...(apiAuthLimiterFlag ? [apiAuthLimiter] : []), async (req, res) => {
   const { refreshToken } = req.body || {};
   if (!refreshToken) {
     return res.status(400).json({ error: 'refreshToken is required' });
@@ -1477,6 +1703,200 @@ v1.get('/creators/:id/content', authRequired, async (req, res) => {
   }
 });
 
+v1.post('/subscription-content/upload-url', authRequired, async (req, res) => {
+  const objectKey = `subscription-content/${req.auth.sub}/${crypto.randomUUID()}`;
+  return res.json({
+    objectKey,
+    uploadUrl: `https://upload.local/${objectKey}`,
+    expiresInSeconds: 900
+  });
+});
+
+v1.post('/subscription-content', authRequired, async (req, res) => {
+  const status = String(req.body?.status || 'draft').trim();
+  const mediaAssetIds = Array.isArray(req.body?.mediaAssetIds) ? req.body.mediaAssetIds.map((id) => String(id).trim()).filter(Boolean) : [];
+  const allowedStatus = new Set(['draft', 'published', 'archived', 'deleted']);
+  if (!allowedStatus.has(status)) {
+    return res.status(400).json({ error: 'invalid status' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const creator = await client.query(
+      `SELECT id
+       FROM creator_profile
+       WHERE user_id = $1
+       LIMIT 1`,
+      [req.auth.sub]
+    );
+    if (creator.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'creator profile required' });
+    }
+
+    const created = await client.query(
+      `INSERT INTO subscription_exclusive_content (
+         creator_id, title, caption, status, published_at, metadata
+       )
+       VALUES (
+         $1, $2, $3, $4::content_status,
+         CASE WHEN $4 = 'published' THEN now() ELSE NULL END,
+         COALESCE($5::jsonb, '{}'::jsonb)
+       )
+       RETURNING *`,
+      [
+        creator.rows[0].id,
+        req.body?.title ? String(req.body.title).trim() : null,
+        req.body?.caption ? String(req.body.caption).trim() : null,
+        status,
+        req.body?.metadata ? JSON.stringify(req.body.metadata) : null
+      ]
+    );
+
+    const content = created.rows[0];
+    if (mediaAssetIds.length > 0) {
+      const ownedMedia = await client.query(
+        `SELECT id
+         FROM media_asset
+         WHERE id = ANY($1::uuid[])
+           AND owner_user_id = $2`,
+        [mediaAssetIds, req.auth.sub]
+      );
+      if (ownedMedia.rows.length !== mediaAssetIds.length) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'all mediaAssetIds must belong to current user' });
+      }
+
+      for (let i = 0; i < mediaAssetIds.length; i += 1) {
+        await client.query(
+          `INSERT INTO subscription_exclusive_content_media (subscription_exclusive_content_id, media_asset_id, sort_order)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (subscription_exclusive_content_id, media_asset_id) DO NOTHING`,
+          [content.id, mediaAssetIds[i], i]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+    return res.status(201).json({ content: sanitizeSubscriptionExclusiveContent(content) });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: 'failed to create subscription content' });
+  } finally {
+    client.release();
+  }
+});
+
+v1.get('/subscription-content/:id', authRequired, async (req, res) => {
+  const contentId = req.params.id;
+
+  try {
+    const result = await pool.query(
+      `SELECT sec.*, c.user_id AS creator_user_id
+       FROM subscription_exclusive_content sec
+       INNER JOIN creator_profile c ON c.id = sec.creator_id
+       WHERE sec.id = $1
+       LIMIT 1`,
+      [contentId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'subscription content not found' });
+    }
+    const content = result.rows[0];
+
+    const isOwner = content.creator_user_id === req.auth.sub;
+    if (!isOwner) {
+      if (content.status !== 'published') {
+        return res.status(403).json({ error: 'content is not published' });
+      }
+      const subscribed = await hasActiveSubscription(req.auth.sub, content.creator_id);
+      if (!subscribed) {
+        return res.status(403).json({ error: 'active subscription required' });
+      }
+    }
+
+    const media = await pool.query(
+      `SELECT ma.id, ma.media_type, ma.storage_provider, ma.storage_bucket, ma.object_key, ma.original_filename, ma.mime_type, ma.byte_size, ma.width, ma.height, ma.duration_seconds, ma.is_public, ma.metadata, ma.created_at
+       FROM subscription_exclusive_content_media secm
+       INNER JOIN media_asset ma ON ma.id = secm.media_asset_id
+       WHERE secm.subscription_exclusive_content_id = $1
+       ORDER BY secm.sort_order ASC, secm.created_at ASC`,
+      [content.id]
+    );
+
+    return res.json({
+      content: sanitizeSubscriptionExclusiveContent(content),
+      media: media.rows
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to fetch subscription content' });
+  }
+});
+
+v1.delete('/subscription-content/:id', authRequired, async (req, res) => {
+  const contentId = req.params.id;
+
+  try {
+    const removed = await pool.query(
+      `DELETE FROM subscription_exclusive_content sec
+       USING creator_profile c
+       WHERE sec.id = $1
+         AND sec.creator_id = c.id
+         AND c.user_id = $2
+       RETURNING sec.id`,
+      [contentId, req.auth.sub]
+    );
+    if (removed.rows.length === 0) {
+      return res.status(404).json({ error: 'subscription content not found' });
+    }
+    return res.json({ deleted: true, contentId });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to delete subscription content' });
+  }
+});
+
+v1.get('/creators/:id/subscription-content', authRequired, async (req, res) => {
+  const creatorId = req.params.id;
+  const limit = Math.min(Math.max(Number(req.query.limit || 20), 1), 100);
+
+  try {
+    const creator = await pool.query(
+      `SELECT id, user_id
+       FROM creator_profile
+       WHERE id = $1
+       LIMIT 1`,
+      [creatorId]
+    );
+    if (creator.rows.length === 0) {
+      return res.status(404).json({ error: 'creator not found' });
+    }
+
+    const creatorProfile = creator.rows[0];
+    const isOwner = creatorProfile.user_id === req.auth.sub;
+    const subscribed = isOwner ? true : await hasActiveSubscription(req.auth.sub, creatorProfile.id);
+    const result = await pool.query(
+      `SELECT id, creator_id, title, caption, status, published_at, metadata, created_at, updated_at
+       FROM subscription_exclusive_content
+       WHERE creator_id = $1
+         AND (
+           $2::boolean = TRUE
+           OR ($3::boolean = TRUE AND status = 'published')
+         )
+       ORDER BY COALESCE(published_at, created_at) DESC
+       LIMIT $4`,
+      [creatorId, isOwner, subscribed, limit]
+    );
+
+    return res.json({
+      subscribed,
+      content: result.rows.map(sanitizeSubscriptionExclusiveContent)
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to fetch creator subscription content' });
+  }
+});
+
 v1.get('/feed', authRequired, async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || 20), 1), 100);
 
@@ -1695,9 +2115,21 @@ v1.post('/payments/tip', authRequired, async (req, res) => {
       referenceId: creator.rows[0].id
     });
 
-    await client.query(
+    const liveForTip = await client.query(
+      `SELECT ls.room_id::text AS room_id
+       FROM live_session ls
+       INNER JOIN creator_profile cp ON cp.id = ls.creator_id
+       WHERE cp.user_id = $1
+         AND ls.status = 'live'
+         AND ls.room_id IS NOT NULL
+       LIMIT 1`,
+      [creatorUserId]
+    );
+
+    const insertedNotif = await client.query(
       `INSERT INTO notification (user_id, type, title, body, payload)
-       VALUES ($1, 'tip', 'New tip received', $2, $3::jsonb)`,
+       VALUES ($1, 'tip', 'New tip received', $2, $3::jsonb)
+       RETURNING id, user_id, type, status, title, body, deep_link, payload, created_at, read_at, archived_at`,
       [
         creatorUserId,
         `${amountCredits} credits tipped to you`,
@@ -1709,6 +2141,24 @@ v1.post('/payments/tip', authRequired, async (req, res) => {
     );
 
     await client.query('COMMIT');
+    const notif = insertedNotif.rows[0];
+    publishNotifyEvent(creatorUserId, 'notification.created', {
+      notification: sanitizeNotificationRow(notif)
+    }).catch((error) => {
+      // eslint-disable-next-line no-console
+      console.error(error.message);
+    });
+    const tipRoomId = liveForTip.rows[0]?.room_id;
+    if (tipRoomId) {
+      publishChatEvent(tipRoomId, 'tip.received', {
+        fromUserId: req.auth.sub,
+        amountCredits,
+        creatorUserId
+      }).catch((error) => {
+        // eslint-disable-next-line no-console
+        console.error(error.message);
+      });
+    }
     return res.status(201).json({ transfer });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -1875,6 +2325,15 @@ v1.get('/notifications', authRequired, async (req, res) => {
   } catch (error) {
     return res.status(500).json({ error: 'failed to fetch notifications' });
   }
+});
+
+v1.get('/notifications/ws-token', authRequired, async (req, res) => {
+  const token = jwt.sign({ sub: req.auth.sub, typ: 'notify' }, accessTokenSecret, { expiresIn: '15m' });
+  return res.json({
+    token,
+    wsUrl: `${chatServiceUrl}/ws?token=${encodeURIComponent(token)}`,
+    longPollUrl: `${chatServiceUrl}/realtime/notify/events?token=${encodeURIComponent(token)}`
+  });
 });
 
 v1.post('/notifications/read', authRequired, async (req, res) => {
@@ -2289,6 +2748,702 @@ v1.post('/chat/rooms/:id/read', authRequired, async (req, res) => {
   }
 });
 
+const createVideoCallRequestHandler = async (req, res) => {
+  const creatorId = String(req.body?.creatorId || '').trim();
+  const requestedExpiresInSeconds = req.body?.expiresInSeconds !== undefined
+    ? Number(req.body.expiresInSeconds)
+    : 300;
+
+  if (!creatorId) {
+    return res.status(400).json({ error: 'creatorId is required' });
+  }
+  if (!Number.isInteger(requestedExpiresInSeconds) || requestedExpiresInSeconds < 60 || requestedExpiresInSeconds > 3600) {
+    return res.status(400).json({ error: 'expiresInSeconds must be an integer between 60 and 3600' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const creatorResult = await client.query(
+      `SELECT id, user_id, video_call_enabled
+       FROM creator_profile
+       WHERE id = $1
+       LIMIT 1
+       FOR UPDATE`,
+      [creatorId]
+    );
+    if (creatorResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'creator not found' });
+    }
+
+    const creator = creatorResult.rows[0];
+    if (creator.user_id === req.auth.sub) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'cannot create call with yourself' });
+    }
+    if (!creator.video_call_enabled) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'video calls are not enabled for this creator' });
+    }
+
+    const existingOpen = await client.query(
+      `SELECT id, status, requested_at, expires_at
+       FROM video_call_request
+       WHERE requester_user_id = $1
+         AND target_creator_id = $2
+         AND status IN ('requested', 'accepted', 'active')
+         AND (expires_at IS NULL OR expires_at > now())
+       ORDER BY requested_at DESC
+       LIMIT 1`,
+      [req.auth.sub, creator.id]
+    );
+    if (existingOpen.rows.length > 0) {
+      await client.query('COMMIT');
+      return res.status(200).json({ request: existingOpen.rows[0], alreadyOpen: true });
+    }
+
+    const created = await client.query(
+      `INSERT INTO video_call_request (
+         requester_user_id, target_creator_id, status, requested_at, expires_at, metadata
+       )
+       VALUES ($1, $2, 'requested', now(), now() + ($3 * interval '1 second'), COALESCE($4::jsonb, '{}'::jsonb))
+       RETURNING id, requester_user_id, target_creator_id, status, requested_at, responded_at, expires_at, decline_reason, metadata`,
+      [
+        req.auth.sub,
+        creator.id,
+        requestedExpiresInSeconds,
+        req.body?.metadata ? JSON.stringify(req.body.metadata) : null
+      ]
+    );
+
+    await client.query('COMMIT');
+    return res.status(201).json({ request: created.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: 'failed to create call request' });
+  } finally {
+    client.release();
+  }
+};
+
+v1.post('/calls/create', authRequired, createVideoCallRequestHandler);
+v1.post('/calls/request', authRequired, createVideoCallRequestHandler);
+
+v1.get('/calls/requests/incoming', authRequired, async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit || 20), 1), 100);
+
+  try {
+    const creator = await pool.query(
+      `SELECT id
+       FROM creator_profile
+       WHERE user_id = $1
+       LIMIT 1`,
+      [req.auth.sub]
+    );
+    if (creator.rows.length === 0) {
+      return res.status(403).json({ error: 'creator profile required' });
+    }
+
+    const result = await pool.query(
+      `SELECT id, requester_user_id, target_creator_id, status, requested_at, responded_at, expires_at, decline_reason, metadata
+       FROM video_call_request
+       WHERE target_creator_id = $1
+       ORDER BY requested_at DESC
+       LIMIT $2`,
+      [creator.rows[0].id, limit]
+    );
+
+    return res.json({ requests: result.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to fetch incoming call requests' });
+  }
+});
+
+v1.get('/calls/requests/outgoing', authRequired, async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit || 20), 1), 100);
+
+  try {
+    const result = await pool.query(
+      `SELECT id, requester_user_id, target_creator_id, status, requested_at, responded_at, expires_at, decline_reason, metadata
+       FROM video_call_request
+       WHERE requester_user_id = $1
+       ORDER BY requested_at DESC
+       LIMIT $2`,
+      [req.auth.sub, limit]
+    );
+
+    return res.json({ requests: result.rows });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to fetch outgoing call requests' });
+  }
+});
+
+v1.post('/calls/:requestId/accept', authRequired, async (req, res) => {
+  const requestId = req.params.requestId;
+  const creditsPerBlock = req.body?.creditsPerBlock !== undefined ? Number(req.body.creditsPerBlock) : 1;
+  const blockDurationSeconds = req.body?.blockDurationSeconds !== undefined ? Number(req.body.blockDurationSeconds) : 120;
+
+  if (!Number.isInteger(creditsPerBlock) || creditsPerBlock <= 0) {
+    return res.status(400).json({ error: 'creditsPerBlock must be a positive integer' });
+  }
+  if (!Number.isInteger(blockDurationSeconds) || blockDurationSeconds <= 0) {
+    return res.status(400).json({ error: 'blockDurationSeconds must be a positive integer' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const requestResult = await client.query(
+      `SELECT vcr.id,
+              vcr.requester_user_id,
+              vcr.target_creator_id,
+              vcr.status,
+              vcr.expires_at,
+              cp.user_id AS creator_user_id
+       FROM video_call_request vcr
+       INNER JOIN creator_profile cp
+         ON cp.id = vcr.target_creator_id
+       WHERE vcr.id = $1
+       LIMIT 1
+       FOR UPDATE`,
+      [requestId]
+    );
+    if (requestResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'call request not found' });
+    }
+
+    const request = requestResult.rows[0];
+    if (request.creator_user_id !== req.auth.sub) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'only target creator can accept this request' });
+    }
+    if (request.status !== 'requested') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'call request is not in requested state' });
+    }
+    if (request.expires_at && new Date(request.expires_at).getTime() <= Date.now()) {
+      await client.query(
+        `UPDATE video_call_request
+         SET status = 'expired',
+             responded_at = now()
+         WHERE id = $1`,
+        [request.id]
+      );
+      await client.query('COMMIT');
+      return res.status(409).json({ error: 'call request has expired' });
+    }
+
+    const room = await client.query(
+      `INSERT INTO chat_room (room_type, created_by_user_id, subject, external_room_key, is_active)
+       VALUES ('video_call', $1, $2, $3, TRUE)
+       RETURNING id`,
+      [req.auth.sub, '1:1 video call', `video-call:${crypto.randomUUID()}`]
+    );
+
+    await client.query(
+      `INSERT INTO chat_room_participant (room_id, user_id, role_in_room, joined_at)
+       VALUES ($1, $2, 'member', now()), ($1, $3, 'member', now())
+       ON CONFLICT (room_id, user_id)
+       DO UPDATE SET
+         role_in_room = EXCLUDED.role_in_room,
+         joined_at = EXCLUDED.joined_at,
+         left_at = NULL`,
+      [room.rows[0].id, request.requester_user_id, request.creator_user_id]
+    );
+
+    const session = await client.query(
+      `INSERT INTO video_call_session (
+         request_id, client_user_id, creator_id, room_id, livekit_room_name, status, expires_at,
+         credits_per_block, block_duration_seconds, metadata
+       )
+       VALUES (
+         $1, $2, $3, $4, $5, 'accepted',
+         now() + interval '15 minutes',
+         $6, $7, COALESCE($8::jsonb, '{}'::jsonb)
+       )
+       RETURNING id`,
+      [
+        request.id,
+        request.requester_user_id,
+        request.target_creator_id,
+        room.rows[0].id,
+        `call-${request.id}`,
+        creditsPerBlock,
+        blockDurationSeconds,
+        req.body?.metadata ? JSON.stringify(req.body.metadata) : null
+      ]
+    );
+
+    await client.query(
+      `UPDATE video_call_request
+       SET status = 'accepted',
+           responded_at = now()
+       WHERE id = $1`,
+      [request.id]
+    );
+
+    await client.query(
+      `INSERT INTO video_call_event (video_call_session_id, event_type, actor_user_id, event_payload)
+       VALUES ($1, 'call.accepted', $2, $3::jsonb)`,
+      [
+        session.rows[0].id,
+        req.auth.sub,
+        JSON.stringify({
+          requestId: request.id
+        })
+      ]
+    );
+
+    await client.query('COMMIT');
+
+    const payload = await getVideoCallSessionById(session.rows[0].id);
+    if (payload?.call?.roomId) {
+      publishChatEvent(payload.call.roomId, 'call.accepted', {
+        callId: payload.call.id,
+        requestId: request.id
+      }).catch((error) => {
+        // eslint-disable-next-line no-console
+        console.error(error.message);
+      });
+    }
+
+    return res.status(201).json({ call: payload?.call || null });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: 'failed to accept call request' });
+  } finally {
+    client.release();
+  }
+});
+
+v1.post('/calls/:requestId/decline', authRequired, async (req, res) => {
+  const requestId = req.params.requestId;
+  const declineReason = req.body?.reason ? String(req.body.reason).trim() : null;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const requestResult = await client.query(
+      `SELECT vcr.id,
+              vcr.status,
+              cp.user_id AS creator_user_id
+       FROM video_call_request vcr
+       INNER JOIN creator_profile cp
+         ON cp.id = vcr.target_creator_id
+       WHERE vcr.id = $1
+       LIMIT 1
+       FOR UPDATE`,
+      [requestId]
+    );
+    if (requestResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'call request not found' });
+    }
+    const request = requestResult.rows[0];
+    if (request.creator_user_id !== req.auth.sub) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'only target creator can decline this request' });
+    }
+    if (request.status !== 'requested') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'call request is not in requested state' });
+    }
+
+    const declined = await client.query(
+      `UPDATE video_call_request
+       SET status = 'declined',
+           responded_at = now(),
+           decline_reason = $2
+       WHERE id = $1
+       RETURNING id, requester_user_id, target_creator_id, status, requested_at, responded_at, expires_at, decline_reason, metadata`,
+      [requestId, declineReason]
+    );
+
+    await client.query('COMMIT');
+    return res.json({ request: declined.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: 'failed to decline call request' });
+  } finally {
+    client.release();
+  }
+});
+
+v1.get('/calls/:id', authRequired, async (req, res) => {
+  try {
+    const payload = await getVideoCallSessionById(req.params.id);
+    if (!payload) {
+      return res.status(404).json({ error: 'call not found' });
+    }
+
+    if (payload.raw.client_user_id !== req.auth.sub && payload.raw.creator_user_id !== req.auth.sub) {
+      return res.status(403).json({ error: 'not a participant of this call' });
+    }
+
+    return res.json({ call: payload.call });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to fetch call' });
+  }
+});
+
+v1.post('/calls/:id/token', authRequired, async (req, res) => {
+  if (!isLiveKitConfigured()) {
+    return res.status(503).json({ error: 'LiveKit is not configured' });
+  }
+
+  try {
+    const payload = await getVideoCallSessionById(req.params.id);
+    if (!payload) {
+      return res.status(404).json({ error: 'call not found' });
+    }
+
+    const isClient = payload.raw.client_user_id === req.auth.sub;
+    const isCreator = payload.raw.creator_user_id === req.auth.sub;
+    if (!isClient && !isCreator) {
+      return res.status(403).json({ error: 'not a participant of this call' });
+    }
+    if (!new Set(['accepted', 'active']).has(payload.raw.status)) {
+      return res.status(409).json({ error: 'call is not joinable' });
+    }
+
+    const currentUser = await getCurrentUserProfile(req.auth.sub);
+    const livekit = issueVideoCallLiveKitCredentials({
+      call: payload.call,
+      userId: req.auth.sub,
+      role: isCreator ? 'creator' : 'client',
+      displayName: currentUser?.display_name
+    });
+
+    return res.json({ call: payload.call, livekit });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to issue call token' });
+  }
+});
+
+v1.post('/calls/:id/join', authRequired, async (req, res) => {
+  const client = await pool.connect();
+  let committed = false;
+  try {
+    await client.query('BEGIN');
+
+    const sessionResult = await client.query(
+      `SELECT vcs.id,
+              vcs.client_user_id,
+              vcs.creator_id,
+              vcs.room_id,
+              vcs.status,
+              vcs.started_at,
+              vcs.ended_at,
+              vcs.expires_at,
+              vcs.credits_per_block,
+              vcs.block_duration_seconds,
+              vcs.total_billed_credits,
+              cp.user_id AS creator_user_id
+       FROM video_call_session vcs
+       INNER JOIN creator_profile cp
+         ON cp.id = vcs.creator_id
+       WHERE vcs.id = $1
+       LIMIT 1
+       FOR UPDATE`,
+      [req.params.id]
+    );
+    if (sessionResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'call not found' });
+    }
+    const session = sessionResult.rows[0];
+
+    const isClient = session.client_user_id === req.auth.sub;
+    const isCreator = session.creator_user_id === req.auth.sub;
+    if (!isClient && !isCreator) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'not a participant of this call' });
+    }
+    if (!new Set(['accepted', 'active']).has(session.status)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'call is not joinable' });
+    }
+
+    const now = Date.now();
+    const expiresAtMs = session.expires_at ? new Date(session.expires_at).getTime() : 0;
+    const isExpired = Boolean(expiresAtMs && expiresAtMs <= now);
+
+    let transfer = null;
+    const shouldCharge = isClient && (session.status === 'accepted' || isExpired);
+    if (shouldCharge) {
+      transfer = await transferCredits({
+        client,
+        fromUserId: req.auth.sub,
+        toUserId: session.creator_user_id,
+        amountCredits: Number(session.credits_per_block),
+        debitEntryType: 'video_call_debit',
+        creditEntryType: 'video_call_credit',
+        referenceType: session.status === 'accepted' ? 'video_call_join' : 'video_call_extend',
+        referenceId: session.id
+      });
+
+      await client.query(
+        `UPDATE video_call_session
+         SET status = 'active',
+             started_at = COALESCE(started_at, now()),
+             expires_at = GREATEST(COALESCE(expires_at, now()), now()) + (block_duration_seconds * interval '1 second'),
+             total_billed_credits = total_billed_credits + credits_per_block,
+             updated_at = now()
+         WHERE id = $1`,
+        [session.id]
+      );
+    }
+
+    await client.query(
+      `INSERT INTO video_call_event (video_call_session_id, event_type, actor_user_id, event_payload)
+       VALUES ($1, 'call.joined', $2, $3::jsonb)`,
+      [
+        session.id,
+        req.auth.sub,
+        JSON.stringify({
+          chargedCredits: transfer ? transfer.amountCredits : 0,
+          participantRole: isCreator ? 'creator' : 'client'
+        })
+      ]
+    );
+
+    await client.query('COMMIT');
+    committed = true;
+
+    const payload = await getVideoCallSessionById(session.id);
+    const currentUser = await getCurrentUserProfile(req.auth.sub);
+    const livekit = isLiveKitConfigured() && payload
+      ? issueVideoCallLiveKitCredentials({
+          call: payload.call,
+          userId: req.auth.sub,
+          role: isCreator ? 'creator' : 'client',
+          displayName: currentUser?.display_name
+        })
+      : null;
+
+    if (payload?.call?.roomId) {
+      publishChatEvent(payload.call.roomId, 'call.joined', {
+        callId: payload.call.id,
+        userId: req.auth.sub,
+        participantRole: isCreator ? 'creator' : 'client',
+        chargedCredits: transfer ? transfer.amountCredits : 0
+      }).catch((error) => {
+        // eslint-disable-next-line no-console
+        console.error(error.message);
+      });
+    }
+
+    return res.json({
+      call: payload?.call || null,
+      chargedCredits: transfer ? transfer.amountCredits : 0,
+      transfer,
+      livekit
+    });
+  } catch (error) {
+    if (!committed) {
+      await client.query('ROLLBACK');
+    }
+    if (error?.code === 'INSUFFICIENT_CREDITS') {
+      return res.status(402).json({ error: 'insufficient credits to join call' });
+    }
+    return res.status(500).json({ error: 'failed to join call' });
+  } finally {
+    client.release();
+  }
+});
+
+v1.post('/calls/:id/extend', authRequired, async (req, res) => {
+  const client = await pool.connect();
+  let committed = false;
+  try {
+    await client.query('BEGIN');
+
+    const sessionResult = await client.query(
+      `SELECT vcs.id,
+              vcs.client_user_id,
+              vcs.room_id,
+              vcs.status,
+              vcs.credits_per_block,
+              cp.user_id AS creator_user_id
+       FROM video_call_session vcs
+       INNER JOIN creator_profile cp
+         ON cp.id = vcs.creator_id
+       WHERE vcs.id = $1
+       LIMIT 1
+       FOR UPDATE`,
+      [req.params.id]
+    );
+    if (sessionResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'call not found' });
+    }
+    const session = sessionResult.rows[0];
+    if (session.client_user_id !== req.auth.sub) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'only call client can extend this call' });
+    }
+    if (session.status !== 'active') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'call is not active' });
+    }
+
+    const transfer = await transferCredits({
+      client,
+      fromUserId: req.auth.sub,
+      toUserId: session.creator_user_id,
+      amountCredits: Number(session.credits_per_block),
+      debitEntryType: 'video_call_debit',
+      creditEntryType: 'video_call_credit',
+      referenceType: 'video_call_extend',
+      referenceId: session.id
+    });
+
+    await client.query(
+      `UPDATE video_call_session
+       SET expires_at = GREATEST(COALESCE(expires_at, now()), now()) + (block_duration_seconds * interval '1 second'),
+           total_billed_credits = total_billed_credits + credits_per_block,
+           updated_at = now()
+       WHERE id = $1`,
+      [session.id]
+    );
+
+    await client.query(
+      `INSERT INTO video_call_event (video_call_session_id, event_type, actor_user_id, event_payload)
+       VALUES ($1, 'call.extended', $2, $3::jsonb)`,
+      [
+        session.id,
+        req.auth.sub,
+        JSON.stringify({
+          chargedCredits: transfer.amountCredits
+        })
+      ]
+    );
+
+    await client.query('COMMIT');
+    committed = true;
+
+    const payload = await getVideoCallSessionById(session.id);
+    if (payload?.call?.roomId) {
+      publishChatEvent(payload.call.roomId, 'call.extended', {
+        callId: payload.call.id,
+        userId: req.auth.sub,
+        chargedCredits: transfer.amountCredits
+      }).catch((error) => {
+        // eslint-disable-next-line no-console
+        console.error(error.message);
+      });
+    }
+
+    return res.json({ call: payload?.call || null, transfer });
+  } catch (error) {
+    if (!committed) {
+      await client.query('ROLLBACK');
+    }
+    if (error?.code === 'INSUFFICIENT_CREDITS') {
+      return res.status(402).json({ error: 'insufficient credits to extend call' });
+    }
+    return res.status(500).json({ error: 'failed to extend call' });
+  } finally {
+    client.release();
+  }
+});
+
+v1.post('/calls/:id/end', authRequired, async (req, res) => {
+  const client = await pool.connect();
+  let committed = false;
+  try {
+    await client.query('BEGIN');
+
+    const sessionResult = await client.query(
+      `SELECT vcs.id,
+              vcs.client_user_id,
+              vcs.room_id,
+              vcs.status,
+              cp.user_id AS creator_user_id
+       FROM video_call_session vcs
+       INNER JOIN creator_profile cp
+         ON cp.id = vcs.creator_id
+       WHERE vcs.id = $1
+       LIMIT 1
+       FOR UPDATE`,
+      [req.params.id]
+    );
+    if (sessionResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'call not found' });
+    }
+    const session = sessionResult.rows[0];
+    if (session.client_user_id !== req.auth.sub && session.creator_user_id !== req.auth.sub) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'not a participant of this call' });
+    }
+    if (session.status === 'ended') {
+      await client.query('COMMIT');
+      const payload = await getVideoCallSessionById(session.id);
+      return res.json({ call: payload?.call || null, alreadyEnded: true });
+    }
+
+    await client.query(
+      `UPDATE video_call_session
+       SET status = 'ended',
+           ended_at = COALESCE(ended_at, now()),
+           updated_at = now()
+       WHERE id = $1`,
+      [session.id]
+    );
+
+    if (session.room_id) {
+      await client.query(
+        `UPDATE chat_room
+         SET is_active = FALSE,
+             updated_at = now()
+         WHERE id = $1`,
+        [session.room_id]
+      );
+    }
+
+    await client.query(
+      `INSERT INTO video_call_event (video_call_session_id, event_type, actor_user_id, event_payload)
+       VALUES ($1, 'call.ended', $2, $3::jsonb)`,
+      [
+        session.id,
+        req.auth.sub,
+        JSON.stringify({
+          endedByUserId: req.auth.sub
+        })
+      ]
+    );
+
+    await client.query('COMMIT');
+    committed = true;
+
+    const payload = await getVideoCallSessionById(session.id);
+    if (payload?.call?.roomId) {
+      publishChatEvent(payload.call.roomId, 'call.ended', {
+        callId: payload.call.id,
+        endedByUserId: req.auth.sub
+      }).catch((error) => {
+        // eslint-disable-next-line no-console
+        console.error(error.message);
+      });
+    }
+
+    return res.json({ call: payload?.call || null });
+  } catch (error) {
+    if (!committed) {
+      await client.query('ROLLBACK');
+    }
+    return res.status(500).json({ error: 'failed to end call' });
+  } finally {
+    client.release();
+  }
+});
+
 v1.post('/streams/start', authRequired, async (req, res) => {
   const title = req.body?.title ? String(req.body.title).trim() : null;
   const description = req.body?.description ? String(req.body.description).trim() : null;
@@ -2684,6 +3839,111 @@ v1.post('/streams/:id/join', authRequired, async (req, res) => {
       return res.status(402).json({ error: 'insufficient credits to join live session' });
     }
     return res.status(500).json({ error: 'failed to join live session' });
+  } finally {
+    client.release();
+  }
+});
+
+v1.post('/streams/:id/extend', authRequired, async (req, res) => {
+  const client = await pool.connect();
+  let committed = false;
+  try {
+    await client.query('BEGIN');
+
+    const sessionResult = await client.query(
+      `SELECT ls.id,
+              ls.room_id,
+              ls.status,
+              ls.extend_price_credits,
+              ls.extend_duration_seconds,
+              cp.user_id AS creator_user_id,
+              lsv.id AS viewer_id,
+              lsv.is_active,
+              lsv.watch_expires_at
+       FROM live_session ls
+       INNER JOIN creator_profile cp
+         ON cp.id = ls.creator_id
+       LEFT JOIN live_session_viewer lsv
+         ON lsv.live_session_id = ls.id
+        AND lsv.viewer_user_id = $2
+       WHERE ls.id = $1
+       LIMIT 1
+       FOR UPDATE`,
+      [req.params.id, req.auth.sub]
+    );
+    if (sessionResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'live session not found' });
+    }
+    const session = sessionResult.rows[0];
+
+    if (session.creator_user_id === req.auth.sub) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'creator does not need to extend own live access' });
+    }
+    if (session.status !== 'live') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'live session is not active' });
+    }
+    if (!session.viewer_id || !session.is_active) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'viewer must join live session before extending' });
+    }
+
+    let transfer = null;
+    if (Number(session.extend_price_credits) > 0) {
+      transfer = await transferCredits({
+        client,
+        fromUserId: req.auth.sub,
+        toUserId: session.creator_user_id,
+        amountCredits: Number(session.extend_price_credits),
+        debitEntryType: 'live_extend_debit',
+        creditEntryType: 'live_extend_credit',
+        referenceType: 'live_session_extend',
+        referenceId: session.id
+      });
+    }
+
+    const updatedViewer = await client.query(
+      `UPDATE live_session_viewer
+       SET watch_expires_at = GREATEST(COALESCE(watch_expires_at, now()), now()) + ($2 * interval '1 second'),
+           updated_at = now()
+       WHERE id = $1
+       RETURNING id, joined_at, left_at, watch_expires_at, is_active`,
+      [session.viewer_id, Number(session.extend_duration_seconds)]
+    );
+
+    await client.query('COMMIT');
+    committed = true;
+
+    const payload = await getLiveSessionById(session.id, req.auth.sub);
+    if (session.room_id) {
+      publishChatEvent(session.room_id, 'live.viewer.extended', {
+        liveSessionId: session.id,
+        viewerUserId: req.auth.sub,
+        chargedCredits: transfer ? transfer.amountCredits : 0,
+        watchExpiresAt: updatedViewer.rows[0].watch_expires_at
+      }).catch((error) => {
+        // eslint-disable-next-line no-console
+        console.error(error.message);
+      });
+    }
+
+    return res.json({
+      stream: payload?.stream || null,
+      viewerAccess: payload?.viewerAccess || null,
+      chargedCredits: transfer ? transfer.amountCredits : 0,
+      transfer,
+      viewer: updatedViewer.rows[0]
+    });
+  } catch (error) {
+    if (!committed) {
+      await client.query('ROLLBACK');
+    }
+    if (error?.code === 'INSUFFICIENT_CREDITS') {
+      return res.status(402).json({ error: 'insufficient credits to extend live session' });
+    }
+    return res.status(500).json({ error: 'failed to extend live session' });
   } finally {
     client.release();
   }

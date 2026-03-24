@@ -29,6 +29,7 @@ services:
       LIVEKIT_URL: ${LIVEKIT_URL:-wss://your-project.livekit.cloud}
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-replace_me}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-replace_me}
+      METRICS_ENABLED: ${METRICS_ENABLED:-1}
     depends_on:
       postgres:
         condition: service_healthy
@@ -64,6 +65,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:-dev_jwt_secret}
       JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-dev_access_secret}
       DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@pgbouncer:6432/${POSTGRES_DB:-stripnoir}
+      METRICS_ENABLED: ${METRICS_ENABLED:-1}
     depends_on:
       redis:
         condition: service_healthy

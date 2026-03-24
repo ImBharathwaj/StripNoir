@@ -360,6 +360,10 @@ paths:
     get:
       tags: [Notification]
       summary: List notifications
+      description: |
+        Polling fallback for the notification inbox. Primary delivery: `GET /api/v1/notifications/ws-token`
+        then connect to the Go service via WebSocket or `GET /realtime/notify/events` long-poll.
+        Successful responses may include `X-StripNoir-Realtime: prefer-go-websocket-or-long-poll`.
       security:
         - bearerAuth: []
       responses:
@@ -375,6 +379,20 @@ paths:
       responses:
         '200':
           description: Marked read count
+
+  /api/v1/notifications/ws-token:
+    get:
+      tags: [Notification]
+      summary: Issue notification stream token for Go websocket / long-poll
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Websocket and long-poll URLs for user-scoped notification events
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotifyTokenResponse'
 
   /api/v1/streams/start:
     post:
@@ -400,6 +418,10 @@ paths:
     get:
       tags: [Stream]
       summary: List active live sessions
+      description: |
+        Periodic REST refresh is a fallback for discovery. For an active session, prefer Go chat/WebSocket
+        (`GET /api/v1/chat/ws-token` for the stream room) and `live.ws_presence` for viewer pressure;
+        use this list for catalog/navigation only, not high-frequency polling.
       responses:
         '200':
           description: Active live session list
@@ -412,6 +434,9 @@ paths:
     get:
       tags: [Stream]
       summary: Get live session details
+      description: |
+        Snapshot of session state (viewer counts, etc.). Prefer realtime events on the stream chat room
+        for live updates instead of tight polling loops. May include `X-StripNoir-Realtime: prefer-go-websocket-or-long-poll`.
       parameters:
         - $ref: '#/components/parameters/LiveSessionId'
       responses:
@@ -648,6 +673,16 @@ components:
         roomId:
           type: string
           format: uuid
+        wsUrl:
+          type: string
+        longPollUrl:
+          type: string
+    NotifyTokenResponse:
+      type: object
+      required: [token, wsUrl, longPollUrl]
+      properties:
+        token:
+          type: string
         wsUrl:
           type: string
         longPollUrl:
