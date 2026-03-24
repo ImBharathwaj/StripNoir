@@ -17,7 +17,7 @@ services:
     environment:
       NODE_ENV: development
       PORT: 3000
-      DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/${POSTGRES_DB:-stripnoir}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@pgbouncer:6432/${POSTGRES_DB:-stripnoir}
       REDIS_URL: redis://redis:6379
       CHAT_SERVICE_URL: http://chat:8080
       CHAT_INTERNAL_API_KEY: ${CHAT_INTERNAL_API_KEY:-}
@@ -32,6 +32,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      pgbouncer:
+        condition: service_started
       redis:
         condition: service_healthy
       chat:
@@ -61,12 +63,14 @@ services:
       CHAT_INTERNAL_API_KEY: ${CHAT_INTERNAL_API_KEY:-}
       JWT_SECRET: ${JWT_SECRET:-dev_jwt_secret}
       JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-dev_access_secret}
-      DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/${POSTGRES_DB:-stripnoir}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@pgbouncer:6432/${POSTGRES_DB:-stripnoir}
     depends_on:
       redis:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      pgbouncer:
+        condition: service_started
     networks:
       - stripnoir
 
@@ -87,6 +91,30 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+    networks:
+      - stripnoir
+
+  pgbouncer:
+    build:
+      context: ./pgbouncer
+    container_name: stripnoir-pgbouncer
+    restart: unless-stopped
+    ports:
+      - "${PGBOUNCER_PORT:-16432}:6432"
+    environment:
+      POSTGRESQL_HOST: postgres
+      POSTGRESQL_PORT: 5432
+      POSTGRESQL_USERNAME: ${POSTGRES_USER:-app}
+      POSTGRESQL_PASSWORD: ${POSTGRES_PASSWORD:-app}
+      POSTGRESQL_DATABASE: ${POSTGRES_DB:-stripnoir}
+      PGBOUNCER_DATABASE: ${POSTGRES_DB:-stripnoir}
+      PGBOUNCER_PORT: 6432
+      PGBOUNCER_POOL_MODE: ${PGBOUNCER_POOL_MODE:-transaction}
+      PGBOUNCER_MAX_CLIENT_CONN: ${PGBOUNCER_MAX_CLIENT_CONN:-500}
+      PGBOUNCER_DEFAULT_POOL_SIZE: ${PGBOUNCER_DEFAULT_POOL_SIZE:-50}
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks:
       - stripnoir
 

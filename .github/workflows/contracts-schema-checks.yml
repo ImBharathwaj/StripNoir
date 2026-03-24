@@ -1,0 +1,23 @@
+name: Contracts and Schema Checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  validate-contracts-schema:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Make check scripts executable
+        run: chmod +x scripts/ci/check_contracts.sh scripts/ci/check_schema_migrations.sh
+
+      - name: Check shared contracts
+        run: ./scripts/ci/check_contracts.sh
+
+      - name: Check schema and migrations
+        run: ./scripts/ci/check_schema_migrations.sh

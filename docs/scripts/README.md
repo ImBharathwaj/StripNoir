@@ -7,6 +7,7 @@ All repeatable manual verification commands should be added here as executable s
 - `check_auth_api.sh` : register/login/me/refresh/logout flow checks.
 - `check_chat_api.sh` : Node chat persistence + Go realtime long-poll delivery check.
 - `check_chat_message_ops.sh` : message edit/delete/read-state API checks.
+- `check_phase1_e2e.sh` : end-to-end Phase 1 smoke flow (auth -> creator/follow/subscription -> media/content/feed -> deposit/tip -> notifications).
 
 ## Run
 ```bash
@@ -15,4 +16,5 @@ cd /home/bharathwaj/Code/StripNoir
 ./docs/scripts/check_auth_api.sh
 ./docs/scripts/check_chat_api.sh
 ./docs/scripts/check_chat_message_ops.sh
+./docs/scripts/check_phase1_e2e.sh
 ```
