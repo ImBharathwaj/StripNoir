@@ -17,6 +17,10 @@ const accessTokenTtl = process.env.JWT_ACCESS_TTL || '15m';
 const refreshTokenTtl = process.env.JWT_REFRESH_TTL || '30d';
 const chatServiceUrl = process.env.CHAT_SERVICE_URL || 'http://localhost:8080';
 const chatInternalApiKey = process.env.CHAT_INTERNAL_API_KEY || '';
+const livekitUrl = process.env.LIVEKIT_URL || '';
+const livekitApiKey = process.env.LIVEKIT_API_KEY || '';
+const livekitApiSecret = process.env.LIVEKIT_API_SECRET || '';
+const livekitTokenTtlSeconds = Math.max(Number(process.env.LIVEKIT_TOKEN_TTL_SECONDS || 3600), 60);
 
 app.use(cors());
 app.use(express.json());
@@ -93,6 +97,44 @@ function sanitizeContent(row) {
     metadata: row.metadata,
     createdAt: row.created_at,
     updatedAt: row.updated_at
+  };
+}
+
+function sanitizeLiveSession(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    id: row.id,
+    creatorId: row.creator_id,
+    creatorUserId: row.creator_user_id,
+    roomId: row.room_id,
+    livekitRoomName: row.livekit_room_name,
+    title: row.title,
+    description: row.description,
+    streamThumbnailUrl: row.stream_thumbnail_url,
+    status: row.status,
+    scheduledStartAt: row.scheduled_start_at,
+    startedAt: row.started_at,
+    endedAt: row.ended_at,
+    baseJoinPriceCredits: row.base_join_price_credits,
+    extendPriceCredits: row.extend_price_credits,
+    extendDurationSeconds: row.extend_duration_seconds,
+    maxConcurrentViewers: row.max_concurrent_viewers,
+    metadata: row.metadata,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    creator: {
+      id: row.creator_id,
+      userId: row.creator_user_id,
+      stageName: row.stage_name,
+      username: row.username,
+      displayName: row.display_name
+    },
+    stats: {
+      activeViewers: Number(row.active_viewer_count || 0)
+    }
   };
 }
 
@@ -330,6 +372,147 @@ async function publishChatEvent(roomId, eventType, payload) {
     const text = await response.text();
     throw new Error(`chat publish failed: ${response.status} ${text}`);
   }
+}
+
+async function getLiveSessionById(sessionId, viewerUserId = null, db = pool) {
+  const result = await db.query(
+    `SELECT ls.*,
+            cp.user_id AS creator_user_id,
+            cp.stage_name,
+            ua.username,
+            ua.display_name,
+            COALESCE(viewers.active_viewer_count, 0)::int AS active_viewer_count,
+            v.id AS viewer_record_id,
+            v.joined_at AS viewer_joined_at,
+            v.left_at AS viewer_left_at,
+            v.watch_expires_at AS viewer_watch_expires_at,
+            v.is_active AS viewer_is_active
+     FROM live_session ls
+     INNER JOIN creator_profile cp
+       ON cp.id = ls.creator_id
+     INNER JOIN user_account ua
+       ON ua.id = cp.user_id
+     LEFT JOIN LATERAL (
+       SELECT COUNT(*)::int AS active_viewer_count
+       FROM live_session_viewer
+       WHERE live_session_id = ls.id
+         AND is_active = TRUE
+     ) viewers ON TRUE
+     LEFT JOIN live_session_viewer v
+       ON v.live_session_id = ls.id
+      AND v.viewer_user_id = $2::uuid
+     WHERE ls.id = $1
+     LIMIT 1`,
+    [sessionId, viewerUserId]
+  );
+
+  if (result.rows.length === 0) {
+    return null;
+  }
+
+  const row = result.rows[0];
+  return {
+    stream: sanitizeLiveSession(row),
+    viewerAccess: viewerUserId
+      ? {
+          isCreator: row.creator_user_id === viewerUserId,
+          hasJoined: Boolean(row.viewer_record_id),
+          isActive: Boolean(row.viewer_is_active),
+          joinedAt: row.viewer_joined_at,
+          leftAt: row.viewer_left_at,
+          watchExpiresAt: row.viewer_watch_expires_at
+        }
+      : undefined
+  };
+}
+
+function isLiveKitConfigured() {
+  return Boolean(
+    livekitUrl
+    && livekitApiKey
+    && livekitApiSecret
+    && livekitApiKey !== 'replace_me'
+    && livekitApiSecret !== 'replace_me'
+  );
+}
+
+function createLiveKitAccessToken({ roomName, identity, name, metadata, grant }) {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+
+  return jwt.sign(
+    {
+      iss: livekitApiKey,
+      sub: identity,
+      nbf: nowSeconds,
+      exp: nowSeconds + livekitTokenTtlSeconds,
+      name,
+      metadata: metadata ? JSON.stringify(metadata) : undefined,
+      video: grant
+    },
+    livekitApiSecret,
+    {
+      algorithm: 'HS256',
+      jwtid: crypto.randomUUID(),
+      header: {
+        typ: 'JWT'
+      }
+    }
+  );
+}
+
+function buildLiveKitGrant({ roomName, role }) {
+  const isHost = role === 'host';
+
+  return {
+    room: roomName,
+    roomJoin: true,
+    roomAdmin: isHost,
+    canPublish: isHost,
+    canPublishData: isHost,
+    canSubscribe: true
+  };
+}
+
+function issueLiveKitSessionCredentials({ stream, userId, role, displayName }) {
+  const participantIdentity = `${role}:${userId}:${stream.id}`;
+  const grant = buildLiveKitGrant({
+    roomName: stream.livekitRoomName,
+    role
+  });
+
+  const token = createLiveKitAccessToken({
+    roomName: stream.livekitRoomName,
+    identity: participantIdentity,
+    name: displayName || participantIdentity,
+    metadata: {
+      appUserId: userId,
+      liveSessionId: stream.id,
+      roomId: stream.roomId,
+      role
+    },
+    grant
+  });
+
+  return {
+    url: livekitUrl,
+    token,
+    roomName: stream.livekitRoomName,
+    participantIdentity,
+    role,
+    grants: grant,
+    expiresInSeconds: livekitTokenTtlSeconds
+  };
+}
+
+async function getCurrentUserProfile(userId, db = pool) {
+  const result = await db.query(
+    `SELECT id, email, username, display_name, status, created_at
+     FROM user_account
+     WHERE id = $1
+     LIMIT 1`,
+    [userId]
+  );
+  return result.rows[0] || null;
 }
 
 v1.post('/auth/register', async (req, res) => {
@@ -2106,8 +2289,478 @@ v1.post('/chat/rooms/:id/read', authRequired, async (req, res) => {
   }
 });
 
-v1.get('/streams/live', (req, res) => {
-  res.json({ streams: [], message: 'Stub live list endpoint.' });
+v1.post('/streams/start', authRequired, async (req, res) => {
+  const title = req.body?.title ? String(req.body.title).trim() : null;
+  const description = req.body?.description ? String(req.body.description).trim() : null;
+  const streamThumbnailUrl = req.body?.streamThumbnailUrl ? String(req.body.streamThumbnailUrl).trim() : null;
+  const scheduledStartAt = req.body?.scheduledStartAt ? new Date(String(req.body.scheduledStartAt)) : null;
+  const scheduledStartAtValue = scheduledStartAt && !Number.isNaN(scheduledStartAt.getTime()) ? scheduledStartAt.toISOString() : null;
+  const baseJoinPriceCredits = req.body?.baseJoinPriceCredits !== undefined ? Number(req.body.baseJoinPriceCredits) : 1;
+  const extendPriceCredits = req.body?.extendPriceCredits !== undefined ? Number(req.body.extendPriceCredits) : 1;
+  const extendDurationSeconds = req.body?.extendDurationSeconds !== undefined ? Number(req.body.extendDurationSeconds) : 120;
+  const maxConcurrentViewers = req.body?.maxConcurrentViewers !== undefined ? Number(req.body.maxConcurrentViewers) : null;
+
+  if (!Number.isInteger(baseJoinPriceCredits) || baseJoinPriceCredits < 0) {
+    return res.status(400).json({ error: 'baseJoinPriceCredits must be a non-negative integer' });
+  }
+  if (!Number.isInteger(extendPriceCredits) || extendPriceCredits < 0) {
+    return res.status(400).json({ error: 'extendPriceCredits must be a non-negative integer' });
+  }
+  if (!Number.isInteger(extendDurationSeconds) || extendDurationSeconds <= 0) {
+    return res.status(400).json({ error: 'extendDurationSeconds must be a positive integer' });
+  }
+  if (maxConcurrentViewers !== null && (!Number.isInteger(maxConcurrentViewers) || maxConcurrentViewers <= 0)) {
+    return res.status(400).json({ error: 'maxConcurrentViewers must be a positive integer when provided' });
+  }
+  if (req.body?.scheduledStartAt && !scheduledStartAtValue) {
+    return res.status(400).json({ error: 'scheduledStartAt must be a valid ISO date-time' });
+  }
+
+  const client = await pool.connect();
+  let committed = false;
+  try {
+    await client.query('BEGIN');
+
+    const creatorResult = await client.query(
+      `SELECT id, user_id, live_enabled
+       FROM creator_profile
+       WHERE user_id = $1
+       LIMIT 1
+       FOR UPDATE`,
+      [req.auth.sub]
+    );
+    if (creatorResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'creator profile required' });
+    }
+
+    const creator = creatorResult.rows[0];
+    if (!creator.live_enabled) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'live streaming is not enabled for this creator' });
+    }
+
+    const existingLive = await client.query(
+      `SELECT id
+       FROM live_session
+       WHERE creator_id = $1
+         AND status = 'live'
+       ORDER BY started_at DESC NULLS LAST, created_at DESC
+       LIMIT 1`,
+      [creator.id]
+    );
+    if (existingLive.rows.length > 0) {
+      await client.query('COMMIT');
+      committed = true;
+      const payload = await getLiveSessionById(existingLive.rows[0].id, req.auth.sub);
+      const currentUser = await getCurrentUserProfile(req.auth.sub);
+      const livekit = isLiveKitConfigured()
+        ? issueLiveKitSessionCredentials({
+            stream: payload.stream,
+            userId: req.auth.sub,
+            role: 'host',
+            displayName: currentUser?.display_name
+          })
+        : null;
+      return res.json({ stream: payload.stream, viewerAccess: payload.viewerAccess, alreadyLive: true, livekit });
+    }
+
+    const room = await client.query(
+      `INSERT INTO chat_room (room_type, created_by_user_id, subject, external_room_key, is_active)
+       VALUES ('live_session', $1, $2, $3, TRUE)
+       RETURNING id`,
+      [req.auth.sub, title, `live:${crypto.randomUUID()}`]
+    );
+
+    const created = await client.query(
+      `INSERT INTO live_session (
+         creator_id,
+         room_id,
+         livekit_room_name,
+         title,
+         description,
+         stream_thumbnail_url,
+         status,
+         scheduled_start_at,
+         started_at,
+         base_join_price_credits,
+         extend_price_credits,
+         extend_duration_seconds,
+         max_concurrent_viewers,
+         metadata
+       )
+       VALUES (
+         $1,
+         $2,
+         $3,
+         $4,
+         $5,
+         $6,
+         'live',
+         $7,
+         now(),
+         $8,
+         $9,
+         $10,
+         $11,
+         COALESCE($12::jsonb, '{}'::jsonb)
+       )
+       RETURNING id`,
+      [
+        creator.id,
+        room.rows[0].id,
+        `live-${req.auth.sub}-${Date.now()}`,
+        title,
+        description,
+        streamThumbnailUrl,
+        scheduledStartAtValue,
+        baseJoinPriceCredits,
+        extendPriceCredits,
+        extendDurationSeconds,
+        maxConcurrentViewers,
+        req.body?.metadata ? JSON.stringify(req.body.metadata) : null
+      ]
+    );
+
+    await client.query('COMMIT');
+    committed = true;
+    const payload = await getLiveSessionById(created.rows[0].id, req.auth.sub);
+    const currentUser = await getCurrentUserProfile(req.auth.sub);
+    const livekit = isLiveKitConfigured()
+      ? issueLiveKitSessionCredentials({
+          stream: payload.stream,
+          userId: req.auth.sub,
+          role: 'host',
+          displayName: currentUser?.display_name
+        })
+      : null;
+    return res.status(201).json({ stream: payload.stream, viewerAccess: payload.viewerAccess, livekit });
+  } catch (error) {
+    if (!committed) {
+      await client.query('ROLLBACK');
+    }
+    return res.status(500).json({ error: 'failed to start live session' });
+  } finally {
+    client.release();
+  }
+});
+
+v1.get('/streams/live', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT ls.*,
+              cp.user_id AS creator_user_id,
+              cp.stage_name,
+              ua.username,
+              ua.display_name,
+              COALESCE(viewers.active_viewer_count, 0)::int AS active_viewer_count
+       FROM live_session ls
+       INNER JOIN creator_profile cp
+         ON cp.id = ls.creator_id
+       INNER JOIN user_account ua
+         ON ua.id = cp.user_id
+       LEFT JOIN LATERAL (
+         SELECT COUNT(*)::int AS active_viewer_count
+         FROM live_session_viewer
+         WHERE live_session_id = ls.id
+           AND is_active = TRUE
+       ) viewers ON TRUE
+       WHERE ls.status = 'live'
+       ORDER BY ls.started_at DESC NULLS LAST, ls.created_at DESC
+       LIMIT 100`
+    );
+
+    return res.json({
+      streams: result.rows.map((row) => sanitizeLiveSession(row))
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to fetch live sessions' });
+  }
+});
+
+v1.get('/streams/:id', async (req, res) => {
+  try {
+    const payload = await getLiveSessionById(req.params.id);
+    if (!payload) {
+      return res.status(404).json({ error: 'live session not found' });
+    }
+    return res.json({ stream: payload.stream });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to fetch live session' });
+  }
+});
+
+v1.post('/streams/:id/token', authRequired, async (req, res) => {
+  if (!isLiveKitConfigured()) {
+    return res.status(503).json({ error: 'LiveKit is not configured' });
+  }
+
+  try {
+    const payload = await getLiveSessionById(req.params.id, req.auth.sub);
+    if (!payload) {
+      return res.status(404).json({ error: 'live session not found' });
+    }
+    if (payload.stream.status !== 'live') {
+      return res.status(409).json({ error: 'live session is not active' });
+    }
+
+    const role = payload.viewerAccess?.isCreator ? 'host' : 'viewer';
+    if (!payload.viewerAccess?.isCreator && !payload.viewerAccess?.isActive) {
+      return res.status(403).json({ error: 'active live-session access required' });
+    }
+
+    const currentUser = await getCurrentUserProfile(req.auth.sub);
+    const livekit = issueLiveKitSessionCredentials({
+      stream: payload.stream,
+      userId: req.auth.sub,
+      role,
+      displayName: currentUser?.display_name
+    });
+
+    return res.json({
+      stream: payload.stream,
+      viewerAccess: payload.viewerAccess,
+      livekit
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to issue live session token' });
+  }
+});
+
+v1.post('/streams/:id/join', authRequired, async (req, res) => {
+  const client = await pool.connect();
+  let committed = false;
+  try {
+    await client.query('BEGIN');
+
+    const sessionResult = await client.query(
+      `SELECT ls.id,
+              ls.creator_id,
+              ls.room_id,
+              ls.status,
+              ls.base_join_price_credits,
+              ls.extend_duration_seconds,
+              ls.max_concurrent_viewers,
+              cp.user_id AS creator_user_id
+       FROM live_session ls
+       INNER JOIN creator_profile cp
+         ON cp.id = ls.creator_id
+       WHERE ls.id = $1
+       LIMIT 1
+       FOR UPDATE`,
+      [req.params.id]
+    );
+    if (sessionResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'live session not found' });
+    }
+
+    const session = sessionResult.rows[0];
+    if (session.status !== 'live') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ error: 'live session is not active' });
+    }
+
+    if (session.creator_user_id === req.auth.sub) {
+      await client.query('COMMIT');
+      committed = true;
+      const payload = await getLiveSessionById(session.id, req.auth.sub);
+      const currentUser = await getCurrentUserProfile(req.auth.sub);
+      const livekit = isLiveKitConfigured()
+        ? issueLiveKitSessionCredentials({
+            stream: payload.stream,
+            userId: req.auth.sub,
+            role: 'host',
+            displayName: currentUser?.display_name
+          })
+        : null;
+      return res.json({ stream: payload.stream, viewerAccess: payload.viewerAccess, joined: false, role: 'host', livekit });
+    }
+
+    const existingViewer = await client.query(
+      `SELECT id, is_active, joined_at, left_at, watch_expires_at
+       FROM live_session_viewer
+       WHERE live_session_id = $1
+         AND viewer_user_id = $2
+       LIMIT 1
+       FOR UPDATE`,
+      [session.id, req.auth.sub]
+    );
+
+    if (!existingViewer.rows[0]?.is_active && session.max_concurrent_viewers) {
+      const activeViewers = await client.query(
+        `SELECT COUNT(*)::int AS count
+         FROM live_session_viewer
+         WHERE live_session_id = $1
+           AND is_active = TRUE`,
+        [session.id]
+      );
+      if (Number(activeViewers.rows[0].count) >= Number(session.max_concurrent_viewers)) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'live session viewer limit reached' });
+      }
+    }
+
+    let transfer = null;
+    if (!existingViewer.rows[0]?.is_active && Number(session.base_join_price_credits) > 0) {
+      transfer = await transferCredits({
+        client,
+        fromUserId: req.auth.sub,
+        toUserId: session.creator_user_id,
+        amountCredits: Number(session.base_join_price_credits),
+        debitEntryType: 'live_join_debit',
+        creditEntryType: 'live_join_credit',
+        referenceType: 'live_session_join',
+        referenceId: session.id
+      });
+    }
+
+    let viewer;
+    if (existingViewer.rows.length > 0) {
+      const updatedViewer = await client.query(
+        `UPDATE live_session_viewer
+         SET joined_at = now(),
+             left_at = NULL,
+             watch_expires_at = now() + ($2 * interval '1 second'),
+             is_active = TRUE
+         WHERE id = $1
+         RETURNING id, joined_at, left_at, watch_expires_at, is_active`,
+        [existingViewer.rows[0].id, Number(session.extend_duration_seconds)]
+      );
+      viewer = updatedViewer.rows[0];
+    } else {
+      const insertedViewer = await client.query(
+        `INSERT INTO live_session_viewer (
+           live_session_id,
+           viewer_user_id,
+           joined_at,
+           watch_expires_at,
+           is_active
+         )
+         VALUES ($1, $2, now(), now() + ($3 * interval '1 second'), TRUE)
+         RETURNING id, joined_at, left_at, watch_expires_at, is_active`,
+        [session.id, req.auth.sub, Number(session.extend_duration_seconds)]
+      );
+      viewer = insertedViewer.rows[0];
+    }
+
+    await client.query('COMMIT');
+    committed = true;
+
+    const payload = await getLiveSessionById(session.id, req.auth.sub);
+    const currentUser = await getCurrentUserProfile(req.auth.sub);
+    const livekit = isLiveKitConfigured()
+      ? issueLiveKitSessionCredentials({
+          stream: payload.stream,
+          userId: req.auth.sub,
+          role: 'viewer',
+          displayName: currentUser?.display_name
+        })
+      : null;
+    if (session.room_id) {
+      publishChatEvent(session.room_id, 'live.viewer.joined', {
+        liveSessionId: session.id,
+        viewerUserId: req.auth.sub
+      }).catch((error) => {
+        // eslint-disable-next-line no-console
+        console.error(error.message);
+      });
+    }
+
+    return res.json({
+      stream: payload.stream,
+      viewerAccess: payload.viewerAccess,
+      joined: true,
+      chargedCredits: transfer ? transfer.amountCredits : 0,
+      transfer,
+      viewer,
+      livekit
+    });
+  } catch (error) {
+    if (!committed) {
+      await client.query('ROLLBACK');
+    }
+    if (error?.code === 'INSUFFICIENT_CREDITS') {
+      return res.status(402).json({ error: 'insufficient credits to join live session' });
+    }
+    return res.status(500).json({ error: 'failed to join live session' });
+  } finally {
+    client.release();
+  }
+});
+
+v1.post('/streams/:id/end', authRequired, async (req, res) => {
+  const client = await pool.connect();
+  let committed = false;
+  try {
+    await client.query('BEGIN');
+
+    const sessionResult = await client.query(
+      `SELECT ls.id, ls.room_id
+       FROM live_session ls
+       INNER JOIN creator_profile cp
+         ON cp.id = ls.creator_id
+       WHERE ls.id = $1
+         AND cp.user_id = $2
+       LIMIT 1
+       FOR UPDATE`,
+      [req.params.id, req.auth.sub]
+    );
+    if (sessionResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'live session not found for current creator' });
+    }
+
+    await client.query(
+      `UPDATE live_session
+       SET status = 'ended',
+           ended_at = COALESCE(ended_at, now()),
+           updated_at = now()
+       WHERE id = $1`,
+      [req.params.id]
+    );
+
+    await client.query(
+      `UPDATE live_session_viewer
+       SET is_active = FALSE,
+           left_at = COALESCE(left_at, now())
+       WHERE live_session_id = $1
+         AND is_active = TRUE`,
+      [req.params.id]
+    );
+
+    if (sessionResult.rows[0].room_id) {
+      await client.query(
+        `UPDATE chat_room
+         SET is_active = FALSE,
+             updated_at = now()
+         WHERE id = $1`,
+        [sessionResult.rows[0].room_id]
+      );
+    }
+
+    await client.query('COMMIT');
+    committed = true;
+
+    const payload = await getLiveSessionById(req.params.id, req.auth.sub);
+    if (sessionResult.rows[0].room_id) {
+      publishChatEvent(sessionResult.rows[0].room_id, 'live.ended', {
+        liveSessionId: req.params.id
+      }).catch((error) => {
+        // eslint-disable-next-line no-console
+        console.error(error.message);
+      });
+    }
+
+    return res.json({ stream: payload?.stream || null });
+  } catch (error) {
+    if (!committed) {
+      await client.query('ROLLBACK');
+    }
+    return res.status(500).json({ error: 'failed to end live session' });
+  } finally {
+    client.release();
+  }
 });
 
 app.use('/api/v1', v1);

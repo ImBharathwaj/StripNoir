@@ -1,0 +1,844 @@
+openapi: 3.1.0
+info:
+  title: StripNoir Public API
+  version: 0.1.0
+  summary: Public Node.js API contract for MVP and realtime orchestration.
+  description: |
+    This contract defines externally supported `/api/v1` APIs for clients.
+    Internal service-to-service contracts are tracked in `shared-contracts/internal-contracts.md`.
+servers:
+  - url: http://localhost:13000
+    description: Local docker development host mapping
+tags:
+  - name: Health
+  - name: Auth
+  - name: User
+  - name: Creator
+  - name: Stream
+  - name: Chat
+  - name: Content
+  - name: Feed
+  - name: Payment
+  - name: Wallet
+  - name: Payout
+  - name: Notification
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: API health
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [service, status, port]
+                properties:
+                  service:
+                    type: string
+                    example: api
+                  status:
+                    type: string
+                    example: ok
+                  port:
+                    type: integer
+                    example: 3000
+
+  /api/v1/auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: User created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    $ref: '#/components/schemas/User'
+
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Login and create session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Session tokens issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Rotate refresh/access tokens
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken:
+                  type: string
+      responses:
+        '200':
+          description: New session tokens
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshResponse'
+
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke refresh session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken:
+                  type: string
+      responses:
+        '200':
+          description: Logout status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  loggedOut:
+                    type: boolean
+
+  /api/v1/auth/me:
+    get:
+      tags: [Auth]
+      summary: Get current user
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Authenticated user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/users/{id}:
+    get:
+      tags: [User]
+      summary: Get user profile with follow stats
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      responses:
+        '200':
+          description: User profile payload
+        '404':
+          description: User not found
+
+  /api/v1/users/{id}/follow:
+    post:
+      tags: [User]
+      summary: Follow a user/creator
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      responses:
+        '201':
+          description: Followed
+
+  /api/v1/users/{id}/unfollow:
+    delete:
+      tags: [User]
+      summary: Unfollow a user/creator
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      responses:
+        '200':
+          description: Unfollowed status
+
+  /api/v1/creators/apply:
+    post:
+      tags: [Creator]
+      summary: Apply/enable creator profile for current user
+      security:
+        - bearerAuth: []
+      responses:
+        '201':
+          description: Creator profile created or updated
+
+  /api/v1/creators/{id}:
+    get:
+      tags: [Creator]
+      summary: Get creator profile
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/CreatorId'
+      responses:
+        '200':
+          description: Creator profile
+        '404':
+          description: Creator not found
+
+  /api/v1/creators/subscription:
+    post:
+      tags: [Creator]
+      summary: Subscribe current user to creator
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [creatorId]
+              properties:
+                creatorId:
+                  type: string
+                  format: uuid
+      responses:
+        '201':
+          description: Subscription active
+
+  /api/v1/content:
+    post:
+      tags: [Content]
+      summary: Create a content post
+      security:
+        - bearerAuth: []
+      responses:
+        '201':
+          description: Content created
+
+  /api/v1/content/{id}:
+    get:
+      tags: [Content]
+      summary: Get content details
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ContentId'
+      responses:
+        '200':
+          description: Content payload
+    delete:
+      tags: [Content]
+      summary: Delete owned content
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ContentId'
+      responses:
+        '200':
+          description: Delete status
+
+  /api/v1/feed:
+    get:
+      tags: [Feed]
+      summary: Get following feed
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Feed entries
+
+  /api/v1/feed/trending:
+    get:
+      tags: [Feed]
+      summary: Get trending feed
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Feed entries
+
+  /api/v1/payments/deposit:
+    post:
+      tags: [Payment]
+      summary: Deposit credits to current wallet
+      security:
+        - bearerAuth: []
+      responses:
+        '201':
+          description: Deposit ledger entry
+
+  /api/v1/payments/subscribe:
+    post:
+      tags: [Payment]
+      summary: Charge subscription payment transfer
+      security:
+        - bearerAuth: []
+      responses:
+        '201':
+          description: Transfer + subscription payload
+
+  /api/v1/payments/tip:
+    post:
+      tags: [Payment]
+      summary: Tip creator from user wallet
+      security:
+        - bearerAuth: []
+      responses:
+        '201':
+          description: Transfer completed
+
+  /api/v1/payments/history:
+    get:
+      tags: [Payment]
+      summary: List wallet ledger history
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Ledger list
+
+  /api/v1/wallet/balance:
+    get:
+      tags: [Wallet]
+      summary: Get current wallet balances
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Wallet balance
+
+  /api/v1/payouts/request:
+    post:
+      tags: [Payout]
+      summary: Create payout request
+      security:
+        - bearerAuth: []
+      responses:
+        '201':
+          description: Payout request created
+
+  /api/v1/payouts/history:
+    get:
+      tags: [Payout]
+      summary: List creator payout requests
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Payout history
+
+  /api/v1/notifications:
+    get:
+      tags: [Notification]
+      summary: List notifications
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Notification list
+
+  /api/v1/notifications/read:
+    post:
+      tags: [Notification]
+      summary: Mark notifications as read
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Marked read count
+
+  /api/v1/streams/start:
+    post:
+      tags: [Stream]
+      summary: Start a live session for the current creator
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StartLiveSessionRequest'
+      responses:
+        '201':
+          description: Live session started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LiveSessionMutationResponse'
+
+  /api/v1/streams/live:
+    get:
+      tags: [Stream]
+      summary: List active live sessions
+      responses:
+        '200':
+          description: Active live session list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LiveSessionListResponse'
+
+  /api/v1/streams/{id}:
+    get:
+      tags: [Stream]
+      summary: Get live session details
+      parameters:
+        - $ref: '#/components/parameters/LiveSessionId'
+      responses:
+        '200':
+          description: Live session details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stream:
+                    $ref: '#/components/schemas/LiveSession'
+        '404':
+          description: Live session not found
+
+  /api/v1/streams/{id}/join:
+    post:
+      tags: [Stream]
+      summary: Join an active live session
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/LiveSessionId'
+      responses:
+        '200':
+          description: Joined live session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LiveSessionMutationResponse'
+        '402':
+          description: Insufficient credits to join
+
+  /api/v1/streams/{id}/token:
+    post:
+      tags: [Stream]
+      summary: Issue a LiveKit token for an active live session
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/LiveSessionId'
+      responses:
+        '200':
+          description: LiveKit token issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LiveSessionMutationResponse'
+        '403':
+          description: Active live-session access required
+        '503':
+          description: LiveKit not configured
+
+  /api/v1/streams/{id}/end:
+    post:
+      tags: [Stream]
+      summary: End an active live session
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/LiveSessionId'
+      responses:
+        '200':
+          description: Live session ended
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stream:
+                    $ref: '#/components/schemas/LiveSession'
+
+  /api/v1/chat/ws-token:
+    get:
+      tags: [Chat]
+      summary: Issue chat token for Go websocket service
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: roomId
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Websocket token + urls
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatTokenResponse'
+        '403':
+          description: Not a participant
+
+  /api/v1/chat/rooms:
+    get:
+      tags: [Chat]
+      summary: List current user rooms
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Room list
+    post:
+      tags: [Chat]
+      summary: Create direct room
+      security:
+        - bearerAuth: []
+      responses:
+        '201':
+          description: Room created
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    UserId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    CreatorId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ContentId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    LiveSessionId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+  schemas:
+    User:
+      type: object
+      required: [id, email, displayName, status, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        username:
+          type: string
+          nullable: true
+        displayName:
+          type: string
+        status:
+          type: string
+          enum: [active, suspended, banned, deleted]
+        createdAt:
+          type: string
+          format: date-time
+    RegisterRequest:
+      type: object
+      required: [email, password, displayName]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+        displayName:
+          type: string
+        username:
+          type: string
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+    LoginResponse:
+      type: object
+      required: [token, refreshToken, sessionId, user]
+      properties:
+        token:
+          type: string
+        refreshToken:
+          type: string
+        sessionId:
+          type: string
+          format: uuid
+        user:
+          $ref: '#/components/schemas/User'
+    RefreshResponse:
+      type: object
+      required: [token, refreshToken, sessionId]
+      properties:
+        token:
+          type: string
+        refreshToken:
+          type: string
+        sessionId:
+          type: string
+          format: uuid
+    ChatTokenResponse:
+      type: object
+      required: [token, roomId, wsUrl, longPollUrl]
+      properties:
+        token:
+          type: string
+        roomId:
+          type: string
+          format: uuid
+        wsUrl:
+          type: string
+        longPollUrl:
+          type: string
+    StartLiveSessionRequest:
+      type: object
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+        streamThumbnailUrl:
+          type: string
+        scheduledStartAt:
+          type: string
+          format: date-time
+        baseJoinPriceCredits:
+          type: integer
+          minimum: 0
+        extendPriceCredits:
+          type: integer
+          minimum: 0
+        extendDurationSeconds:
+          type: integer
+          minimum: 1
+        maxConcurrentViewers:
+          type: integer
+          minimum: 1
+    LiveSession:
+      type: object
+      required: [id, creatorId, creatorUserId, livekitRoomName, status, baseJoinPriceCredits, extendPriceCredits, extendDurationSeconds, metadata, createdAt, updatedAt, creator, stats]
+      properties:
+        id:
+          type: string
+          format: uuid
+        creatorId:
+          type: string
+          format: uuid
+        creatorUserId:
+          type: string
+          format: uuid
+        roomId:
+          type: string
+          format: uuid
+          nullable: true
+        livekitRoomName:
+          type: string
+        title:
+          type: string
+          nullable: true
+        description:
+          type: string
+          nullable: true
+        streamThumbnailUrl:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [scheduled, live, ended, cancelled]
+        scheduledStartAt:
+          type: string
+          format: date-time
+          nullable: true
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+        endedAt:
+          type: string
+          format: date-time
+          nullable: true
+        baseJoinPriceCredits:
+          type: integer
+        extendPriceCredits:
+          type: integer
+        extendDurationSeconds:
+          type: integer
+        maxConcurrentViewers:
+          type: integer
+          nullable: true
+        metadata:
+          type: object
+          additionalProperties: true
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        creator:
+          type: object
+          required: [id, userId, stageName]
+          properties:
+            id:
+              type: string
+              format: uuid
+            userId:
+              type: string
+              format: uuid
+            stageName:
+              type: string
+            username:
+              type: string
+              nullable: true
+            displayName:
+              type: string
+              nullable: true
+        stats:
+          type: object
+          required: [activeViewers]
+          properties:
+            activeViewers:
+              type: integer
+    LiveSessionViewerAccess:
+      type: object
+      required: [isCreator, hasJoined, isActive]
+      properties:
+        isCreator:
+          type: boolean
+        hasJoined:
+          type: boolean
+        isActive:
+          type: boolean
+        joinedAt:
+          type: string
+          format: date-time
+          nullable: true
+        leftAt:
+          type: string
+          format: date-time
+          nullable: true
+        watchExpiresAt:
+          type: string
+          format: date-time
+          nullable: true
+    LiveSessionListResponse:
+      type: object
+      required: [streams]
+      properties:
+        streams:
+          type: array
+          items:
+            $ref: '#/components/schemas/LiveSession'
+    LiveSessionMutationResponse:
+      type: object
+      required: [stream]
+      properties:
+        stream:
+          $ref: '#/components/schemas/LiveSession'
+        viewerAccess:
+          $ref: '#/components/schemas/LiveSessionViewerAccess'
+        livekit:
+          $ref: '#/components/schemas/LiveKitSessionCredentials'
+        alreadyLive:
+          type: boolean
+        joined:
+          type: boolean
+        role:
+          type: string
+        chargedCredits:
+          type: integer
+    LiveKitSessionCredentials:
+      type: object
+      required: [url, token, roomName, participantIdentity, role, grants, expiresInSeconds]
+      properties:
+        url:
+          type: string
+        token:
+          type: string
+        roomName:
+          type: string
+        participantIdentity:
+          type: string
+        role:
+          type: string
+          enum: [host, viewer]
+        grants:
+          type: object
+          required: [room, roomJoin, roomAdmin, canPublish, canPublishData, canSubscribe]
+          properties:
+            room:
+              type: string
+            roomJoin:
+              type: boolean
+            roomAdmin:
+              type: boolean
+            canPublish:
+              type: boolean
+            canPublishData:
+              type: boolean
+            canSubscribe:
+              type: boolean
+        expiresInSeconds:
+          type: integer

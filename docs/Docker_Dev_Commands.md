@@ -61,6 +61,9 @@ docker exec -it stripnoir-chat sh
 # Postgres container
 docker exec -it stripnoir-postgres sh
 
+# PgBouncer container
+docker exec -it stripnoir-pgbouncer sh
+
 # Redis container
 docker exec -it stripnoir-redis sh
 ```
@@ -81,6 +84,9 @@ curl -i http://localhost:13000
 # Check Go chat service from host
 curl -i http://localhost:18080
 
+# Check PgBouncer from host
+nc -vz localhost 16432
+
 # Check Redis ping from inside container
 docker exec -it stripnoir-redis redis-cli ping
 ```
@@ -93,6 +99,9 @@ docker compose restart api
 
 # Restart only Go chat
 docker compose restart chat
+
+# Restart PgBouncer
+docker compose restart pgbouncer
 ```
 
 ## 7. Inspect Crash / Exit Details
