@@ -10,6 +10,7 @@ EXTEND_CREDITS="${EXTEND_CREDITS:-2}"
 EXTEND_DURATION_SECONDS="${EXTEND_DURATION_SECONDS:-120}"
 MAX_CONCURRENT_VIEWERS="${MAX_CONCURRENT_VIEWERS:-10}"
 SKIP_DB_CHECK="${SKIP_DB_CHECK:-0}"
+REQUIRE_LIVEKIT="${REQUIRE_LIVEKIT:-0}"
 
 CREATOR_EMAIL="${CREATOR_EMAIL:-live.creator.${RUN_ID}@example.com}"
 VIEWER_EMAIL="${VIEWER_EMAIL:-live.viewer.${RUN_ID}@example.com}"
@@ -149,6 +150,12 @@ expect_jq "$BODY" '.stream.status == "live"' "started stream should be live"
 STREAM_ID=$(echo "$BODY" | jq -r '.stream.id')
 ROOM_ID=$(echo "$BODY" | jq -r '.stream.roomId')
 LIVEKIT_ENABLED=$(echo "$BODY" | jq -r 'if .livekit then "1" else "0" end')
+if [[ "$REQUIRE_LIVEKIT" == "1" && "$LIVEKIT_ENABLED" != "1" ]]; then
+  echo "FAILED: REQUIRE_LIVEKIT=1 but API did not return a livekit payload in stream start response" >&2
+  echo "Start response:" >&2
+  echo "$BODY" >&2
+  exit 1
+fi
 if [[ "$LIVEKIT_ENABLED" == "1" ]]; then
   expect_jq "$BODY" '.livekit.role == "host" and .livekit.grants.canPublish == true and .livekit.grants.canSubscribe == true' "creator start response should include host LiveKit grants"
 fi
@@ -175,12 +182,13 @@ if [[ "$LIVEKIT_ENABLED" == "1" ]]; then
   BODY=$(request_json "POST" "$API_BASE_URL/api/v1/streams/$STREAM_ID/token" "" "$VIEWER_TOKEN")
   STATUS=$(cat "$TMP_DIR/code.txt")
   expect_status "$STATUS" "200" "issue viewer livekit token"
+  expect_jq "$BODY" '.livekit.url != null and .livekit.token != null and .livekit.roomName != null' "viewer token endpoint should include token+room"
   expect_jq "$BODY" '.livekit.role == "viewer" and .viewerAccess.isActive == true' "viewer token endpoint should return active viewer credentials"
 
   BODY=$(request_json "POST" "$API_BASE_URL/api/v1/streams/$STREAM_ID/token" "" "$CREATOR_TOKEN")
   STATUS=$(cat "$TMP_DIR/code.txt")
   expect_status "$STATUS" "200" "issue creator livekit token"
-  expect_jq "$BODY" '.livekit.role == "host" and .livekit.grants.canPublish == true' "creator token endpoint should return host credentials"
+  expect_jq "$BODY" '.livekit.url != null and .livekit.token != null and .livekit.grants.canPublish == true' "creator token endpoint should return publishable host credentials"
 fi
 
 echo "[10/13] Validate stream detail after join"

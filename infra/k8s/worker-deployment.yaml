@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stripnoir-worker
+  namespace: stripnoir
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stripnoir-worker
+  template:
+    metadata:
+      labels:
+        app: stripnoir-worker
+    spec:
+      containers:
+        - name: worker
+          image: stripnoir/worker:latest
+          env:
+            - name: REDIS_URL
+              value: redis://redis:6379
+            - name: WORKER_NOTIFICATION_QUEUE
+              value: stripnoir:queue:notifications
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"

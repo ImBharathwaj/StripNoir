@@ -1,4 +1,21 @@
 services:
+  gateway:
+    build:
+      context: ./nginx
+    container_name: stripnoir-gateway
+    restart: unless-stopped
+    ports:
+      - "${GATEWAY_PORT:-14000}:80"
+    depends_on:
+      api:
+        condition: service_started
+      chat:
+        condition: service_started
+    networks:
+      - stripnoir
+    profiles:
+      - gateway
+
   api:
     image: node:20-alpine
     container_name: stripnoir-api
@@ -18,9 +35,22 @@ services:
       NODE_ENV: development
       PORT: 3000
       DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@pgbouncer:6432/${POSTGRES_DB:-stripnoir}
+      DATABASE_READ_URL: ${DATABASE_READ_URL:-}
       REDIS_URL: redis://redis:6379
       CHAT_SERVICE_URL: http://chat:8080
+      CHAT_PUBLIC_URL: ${CHAT_PUBLIC_URL:-}
       CHAT_INTERNAL_API_KEY: ${CHAT_INTERNAL_API_KEY:-}
+      CHAT_HISTORY_DELEGATE: ${CHAT_HISTORY_DELEGATE:-}
+      CHAT_HISTORY_SHADOW: ${CHAT_HISTORY_SHADOW:-}
+      LIVE_AGGREGATE_DELEGATE: ${LIVE_AGGREGATE_DELEGATE:-}
+      ALLOW_FREE_SUBSCRIPTION: ${ALLOW_FREE_SUBSCRIPTION:-}
+      SUBSCRIBERS_ONLY_CATALOG: ${SUBSCRIBERS_ONLY_CATALOG:-}
+      # MinIO/S3 presigned upload URL generation
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://localhost:19000}
+      MINIO_BUCKET: ${MINIO_BUCKET:-stripnoir}
+      MINIO_REGION: ${MINIO_REGION:-us-east-1}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio123}
       JWT_SECRET: ${JWT_SECRET:-dev_jwt_secret}
       JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-dev_access_secret}
       JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-dev_refresh_secret}
@@ -29,6 +59,7 @@ services:
       LIVEKIT_URL: ${LIVEKIT_URL:-wss://your-project.livekit.cloud}
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-replace_me}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-replace_me}
+      METRICS_ENABLED: ${METRICS_ENABLED:-1}
     depends_on:
       postgres:
         condition: service_healthy
@@ -64,6 +95,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:-dev_jwt_secret}
       JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-dev_access_secret}
       DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@pgbouncer:6432/${POSTGRES_DB:-stripnoir}
+      METRICS_ENABLED: ${METRICS_ENABLED:-1}
     depends_on:
       redis:
         condition: service_healthy
@@ -134,6 +166,45 @@ services:
       retries: 20
     networks:
       - stripnoir
+
+  worker:
+    image: node:20-alpine
+    container_name: stripnoir-worker
+    working_dir: /app
+    command: >
+      sh -lc "if [ -f package.json ]; then
+        npm install && node src/index.js;
+      else
+        echo 'services/worker not initialized';
+        tail -f /dev/null;
+      fi"
+    volumes:
+      - ../services/worker:/app
+    environment:
+      REDIS_URL: redis://redis:6379
+      WORKER_NOTIFICATION_QUEUE: ${WORKER_NOTIFICATION_QUEUE:-stripnoir:queue:notifications}
+      WORKER_POLL_BLOCK_SEC: ${WORKER_POLL_BLOCK_SEC:-5}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - stripnoir
+    profiles:
+      - worker
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.96.0
+    container_name: stripnoir-otel
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel/collector-config.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "${OTEL_GRPC_PORT:-14317}:4317"
+      - "${OTEL_HTTP_PORT:-14318}:4318"
+    networks:
+      - stripnoir
+    profiles:
+      - observability
 
   minio:
     image: minio/minio:latest
