@@ -340,7 +340,7 @@ func notifyPublishHandler(redisClient *redis.Client, internalKey string) http.Ha
 	}
 }
 
-func wsHandler(redisClient *redis.Client, jwtSecrets []string) http.HandlerFunc {
+func wsHandler(redisClient *redis.Client, jwtSecrets []string, dbPool *pgxpool.Pool) http.HandlerFunc {
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
@@ -407,7 +407,91 @@ func wsHandler(redisClient *redis.Client, jwtSecrets []string) http.HandlerFunc 
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
+			viewerUserID := claims.Subject
+			blockCache := map[string]bool{}
+			moderationCache := map[string]bool{}
+
 			for msg := range pubCh {
+				deliver := true
+				if dbPool != nil && strings.HasPrefix(strings.TrimSpace(msg.Payload), "{") {
+					// Best-effort filtering:
+					// - blocking: suppress room events from a blocked sender
+					// - moderation: suppress messages hidden by moderation actions
+					var ce chatEvent
+					if err := json.Unmarshal([]byte(msg.Payload), &ce); err == nil && strings.HasPrefix(ce.EventType, "message.") {
+						var mp struct {
+							Message struct {
+								ID            string `json:"id"`
+								SenderUserID string `json:"sender_user_id"`
+							} `json:"message"`
+						}
+						if err := json.Unmarshal(ce.Payload, &mp); err == nil && strings.TrimSpace(mp.Message.ID) != "" {
+							messageID := strings.TrimSpace(mp.Message.ID)
+
+							// 1) Moderation: hide/remove content
+							if v, ok := moderationCache[messageID]; ok && v {
+								deliver = false
+							} else if v, ok := moderationCache[messageID]; ok && !v {
+								// already known as visible
+							} else {
+								queryCtx, queryCancel := context.WithTimeout(context.Background(), 1*time.Second)
+								var hidden bool
+								err2 := dbPool.QueryRow(queryCtx, `
+									SELECT EXISTS(
+										SELECT 1
+										FROM moderation_report mr
+										INNER JOIN moderation_action ma ON ma.report_id = mr.id
+										WHERE mr.target_type = 'message'
+										  AND mr.target_id = $1::uuid
+										  AND ma.action_type IN ('hide_content', 'remove_content')
+										  AND (ma.expires_at IS NULL OR ma.expires_at > now())
+										LIMIT 1
+									)`, messageID).Scan(&hidden)
+								queryCancel()
+								if err2 == nil {
+									moderationCache[messageID] = hidden
+									if hidden {
+										deliver = false
+									}
+								}
+							}
+
+							// 2) Blocking: suppress events from blocked sender
+							if deliver && strings.TrimSpace(mp.Message.SenderUserID) != "" {
+								senderID := strings.TrimSpace(mp.Message.SenderUserID)
+								cacheKey := viewerUserID + "|" + senderID
+								if v, ok := blockCache[cacheKey]; ok && v {
+									deliver = false
+								} else if v, ok := blockCache[cacheKey]; ok && !v {
+									// cached visible
+								} else {
+									queryCtx, queryCancel := context.WithTimeout(context.Background(), 1*time.Second)
+									var blocked bool
+									err2 := dbPool.QueryRow(queryCtx, `
+										SELECT EXISTS(
+											SELECT 1
+											FROM user_block
+											WHERE (blocker_user_id = $1::uuid AND blocked_user_id = $2::uuid)
+											   OR (blocker_user_id = $2::uuid AND blocked_user_id = $1::uuid)
+											LIMIT 1
+										)`, viewerUserID, senderID).Scan(&blocked)
+									queryCancel()
+									if err2 == nil {
+										blockCache[cacheKey] = blocked
+										if blocked {
+											deliver = false
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+
+				if !deliver {
+					continue
+				}
+
 				if err := conn.WriteMessage(websocket.TextMessage, []byte(msg.Payload)); err != nil {
 					return
 				}
@@ -459,7 +543,7 @@ func runNotifyWebSocket(w http.ResponseWriter, r *http.Request, redisClient *red
 	}
 }
 
-func longPollEventsHandler(redisClient *redis.Client, jwtSecrets []string) http.HandlerFunc {
+func longPollEventsHandler(redisClient *redis.Client, jwtSecrets []string, dbPool *pgxpool.Pool) http.HandlerFunc {
 	const prefix = "/realtime/rooms/"
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -480,10 +564,12 @@ func longPollEventsHandler(redisClient *redis.Client, jwtSecrets []string) http.
 		if token == "" {
 			token = extractBearerToken(r)
 		}
-		if _, err := parseRealtimeToken(token, jwtSecrets, roomID); err != nil {
+		claims, err := parseRealtimeToken(token, jwtSecrets, roomID)
+		if err != nil {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
 			return
 		}
+		viewerUserID := claims.Subject
 
 		timeoutSec := 25
 		if rawTimeout := r.URL.Query().Get("timeoutSec"); rawTimeout != "" {
@@ -511,13 +597,76 @@ func longPollEventsHandler(redisClient *redis.Client, jwtSecrets []string) http.
 				"events": []any{},
 			})
 		case msg := <-pubCh:
+			// Chat safety: filter message events for blocked senders / hidden moderation actions.
+			deliver := true
+			if dbPool != nil && strings.HasPrefix(strings.TrimSpace(msg.Payload), "{") {
+				var ce chatEvent
+				if err := json.Unmarshal([]byte(msg.Payload), &ce); err == nil && strings.HasPrefix(ce.EventType, "message.") {
+					var mp struct {
+						Message struct {
+							ID            string `json:"id"`
+							SenderUserID string `json:"sender_user_id"`
+						} `json:"message"`
+					}
+					if err := json.Unmarshal(ce.Payload, &mp); err == nil && strings.TrimSpace(mp.Message.ID) != "" {
+						messageID := strings.TrimSpace(mp.Message.ID)
+
+						// moderation hidden?
+						queryCtx, queryCancel := context.WithTimeout(context.Background(), 1*time.Second)
+						var hidden bool
+						err2 := dbPool.QueryRow(queryCtx, `
+							SELECT EXISTS(
+								SELECT 1
+								FROM moderation_report mr
+								INNER JOIN moderation_action ma ON ma.report_id = mr.id
+								WHERE mr.target_type = 'message'
+								  AND mr.target_id = $1::uuid
+								  AND ma.action_type IN ('hide_content', 'remove_content')
+								  AND (ma.expires_at IS NULL OR ma.expires_at > now())
+								LIMIT 1
+							)`, messageID).Scan(&hidden)
+						queryCancel()
+						if err2 == nil && hidden {
+							deliver = false
+						}
+
+						// blocking?
+						if deliver && strings.TrimSpace(mp.Message.SenderUserID) != "" {
+							senderID := strings.TrimSpace(mp.Message.SenderUserID)
+							queryCtx2, queryCancel2 := context.WithTimeout(context.Background(), 1*time.Second)
+							var blocked bool
+							err3 := dbPool.QueryRow(queryCtx2, `
+								SELECT EXISTS(
+									SELECT 1
+									FROM user_block
+									WHERE (blocker_user_id = $1::uuid AND blocked_user_id = $2::uuid)
+									   OR (blocker_user_id = $2::uuid AND blocked_user_id = $1::uuid)
+									LIMIT 1
+								)`, viewerUserID, senderID).Scan(&blocked)
+							queryCancel2()
+							if err3 == nil && blocked {
+								deliver = false
+							}
+						}
+					}
+				}
+			}
+
 			var event any
-			if err := json.Unmarshal([]byte(msg.Payload), &event); err != nil {
+			if !deliver {
+				event = nil
+			} else if err := json.Unmarshal([]byte(msg.Payload), &event); err != nil {
 				event = map[string]any{"raw": msg.Payload}
 			}
-			writeJSON(w, http.StatusOK, map[string]any{
-				"events": []any{event},
-			})
+			if !deliver {
+				writeJSON(w, http.StatusOK, map[string]any{
+					"events": []any{},
+				})
+			} else {
+				writeJSON(w, http.StatusOK, map[string]any{
+					"events": []any{event},
+				})
+			}
 		}
 	}
 }
@@ -606,14 +755,35 @@ func main() {
 	redisClient := redis.NewClient(redisOpt)
 	defer redisClient.Close()
 
+	var dbPool *pgxpool.Pool
+	if strings.TrimSpace(databaseURL) != "" {
+		p, err := pgxpool.New(context.Background(), databaseURL)
+		if err != nil {
+			log.Printf("pg pool for internal history/aggregate disabled: %v", err)
+		} else {
+			dbPool = p
+			defer dbPool.Close()
+		}
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler(port))
 	mux.HandleFunc("/health/deps", depsHealthHandler(databaseURL, redisClient))
-	mux.HandleFunc("/ws", wsHandler(redisClient, jwtSecrets))
-	mux.HandleFunc("/realtime/rooms/", longPollEventsHandler(redisClient, jwtSecrets))
+	mux.HandleFunc("/ws", wsHandler(redisClient, jwtSecrets, dbPool))
+	mux.HandleFunc("/realtime/rooms/", longPollEventsHandler(redisClient, jwtSecrets, dbPool))
 	mux.HandleFunc("/realtime/notify/events", notifyLongPollEventsHandler(redisClient, jwtSecrets))
 	mux.HandleFunc("/internal/chat/publish", publishHandler(redisClient, internalKey))
 	mux.HandleFunc("/internal/notify/publish", notifyPublishHandler(redisClient, internalKey))
+
+	if dbPool != nil {
+		mux.HandleFunc("GET /internal/history/rooms/{roomId}/messages", listMessagesHandler(redisClient, dbPool, internalKey))
+		mux.HandleFunc("POST /internal/history/rooms/{roomId}/messages", postMessageHandler(redisClient, dbPool, internalKey))
+		mux.HandleFunc("PATCH /internal/history/rooms/{roomId}/messages/{messageId}", patchMessageHandler(redisClient, dbPool, internalKey))
+		mux.HandleFunc("DELETE /internal/history/rooms/{roomId}/messages/{messageId}", deleteMessageHandler(redisClient, dbPool, internalKey))
+		mux.HandleFunc("GET /internal/live/sessions/{sessionId}/aggregate", liveSessionAggregateHandler(redisClient, dbPool, internalKey))
+	}
+	mux.HandleFunc("GET /internal/ledger/health", ledgerHealthHandler(internalKey))
+	mux.HandleFunc("POST /internal/ledger/transfer", ledgerTransferStubHandler(internalKey))
 
 	mchat := newChatMetrics()
 	var handler http.Handler = mux

@@ -15,6 +15,7 @@ CREATOR_USERNAME="${CREATOR_USERNAME:-call_creator_${RUN_ID}}"
 FAN_USERNAME="${FAN_USERNAME:-call_fan_${RUN_ID}}"
 CREDITS_PER_BLOCK="${CREDITS_PER_BLOCK:-2}"
 BLOCK_SECONDS="${BLOCK_SECONDS:-60}"
+REQUIRE_LIVEKIT="${REQUIRE_LIVEKIT:-0}"
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "jq is required for this script. Install jq and retry." >&2
@@ -122,9 +123,47 @@ BODY=$(request_json "POST" "$API_BASE_URL/api/v1/calls/$CALL_ID/join" "{}" "$FAN
 expect_status "$(cat "$TMP_DIR/code.txt")" "200" "fan join"
 expect_jq "$BODY" --argjson c "$CREDITS_PER_BLOCK" '.chargedCredits == $c' "fan should pay first block"
 
+FAN_LIVEKIT_ENABLED=$(echo "$BODY" | jq -r 'if .livekit then "1" else "0" end')
+if [[ "$REQUIRE_LIVEKIT" == "1" && "$FAN_LIVEKIT_ENABLED" != "1" ]]; then
+  echo "FAILED: REQUIRE_LIVEKIT=1 but fan join did not return a livekit payload" >&2
+  echo "Join response:" >&2
+  echo "$BODY" >&2
+  exit 1
+fi
+if [[ "$FAN_LIVEKIT_ENABLED" == "1" ]]; then
+  expect_jq "$BODY" '.livekit.role == "client" and .livekit.grants.canPublish == true and .livekit.grants.canSubscribe == true' "fan join should include client LiveKit grants"
+  expect_jq "$BODY" '.livekit.url != null and .livekit.token != null' "fan join should include LiveKit url+token"
+fi
+
 BODY=$(request_json "POST" "$API_BASE_URL/api/v1/calls/$CALL_ID/join" "{}" "$CREATOR_TOKEN")
 expect_status "$(cat "$TMP_DIR/code.txt")" "200" "creator join"
 expect_jq "$BODY" '.chargedCredits == 0' "creator join should not debit"
+
+CREATOR_LIVEKIT_ENABLED=$(echo "$BODY" | jq -r 'if .livekit then "1" else "0" end')
+if [[ "$REQUIRE_LIVEKIT" == "1" && "$CREATOR_LIVEKIT_ENABLED" != "1" ]]; then
+  echo "FAILED: REQUIRE_LIVEKIT=1 but creator join did not return a livekit payload" >&2
+  echo "Join response:" >&2
+  echo "$BODY" >&2
+  exit 1
+fi
+if [[ "$CREATOR_LIVEKIT_ENABLED" == "1" ]]; then
+  expect_jq "$BODY" '.livekit.role == "creator" and .livekit.grants.canPublish == true and .livekit.grants.canSubscribe == true' "creator join should include creator LiveKit grants"
+  expect_jq "$BODY" '.livekit.url != null and .livekit.token != null' "creator join should include LiveKit url+token"
+fi
+
+if [[ "$FAN_LIVEKIT_ENABLED" == "1" ]]; then
+  echo "[7.1/10] Validate LiveKit token issuance for both sides"
+
+  BODY=$(request_json "POST" "$API_BASE_URL/api/v1/calls/$CALL_ID/token" "" "$FAN_TOKEN")
+  STATUS=$(cat "$TMP_DIR/code.txt")
+  expect_status "$STATUS" "200" "issue fan LiveKit call token"
+  expect_jq "$BODY" '.livekit.role == "client" and .livekit.url != null and .livekit.token != null and .livekit.grants.canSubscribe == true' "fan token should include room+token+subscribe grant"
+
+  BODY=$(request_json "POST" "$API_BASE_URL/api/v1/calls/$CALL_ID/token" "" "$CREATOR_TOKEN")
+  STATUS=$(cat "$TMP_DIR/code.txt")
+  expect_status "$STATUS" "200" "issue creator LiveKit call token"
+  expect_jq "$BODY" '.livekit.role == "creator" and .livekit.url != null and .livekit.token != null and .livekit.grants.canSubscribe == true' "creator token should include room+token+subscribe grant"
+fi
 
 echo "[8/10] Extend (fan)"
 BODY=$(request_json "POST" "$API_BASE_URL/api/v1/calls/$CALL_ID/extend" "{}" "$FAN_TOKEN")

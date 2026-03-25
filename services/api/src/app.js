@@ -4,7 +4,7 @@ const morgan = require('morgan');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
-const { checkPostgres, closePostgres } = require('./infra/db');
+const { checkPostgres, checkPostgresRead, closePostgres } = require('./infra/db');
 const { checkRedis, closeRedis, redisClient, ensureRedisConnected } = require('./infra/redis');
 const { pool } = require('./infra/db');
 const {
@@ -25,11 +25,133 @@ const refreshTokenSecret = process.env.JWT_REFRESH_SECRET || `${accessTokenSecre
 const accessTokenTtl = process.env.JWT_ACCESS_TTL || '15m';
 const refreshTokenTtl = process.env.JWT_REFRESH_TTL || '30d';
 const chatServiceUrl = process.env.CHAT_SERVICE_URL || 'http://localhost:8080';
+/** Browser-facing chat/realtime origin (ws/long-poll). Falls back to CHAT_SERVICE_URL. Use behind API gateway. */
+const chatPublicUrl = process.env.CHAT_PUBLIC_URL || chatServiceUrl;
+const chatHistoryDelegate =
+  String(process.env.CHAT_HISTORY_DELEGATE || '').toLowerCase() === '1' ||
+  String(process.env.CHAT_HISTORY_DELEGATE || '').toLowerCase() === 'true';
+const chatHistoryShadow =
+  String(process.env.CHAT_HISTORY_SHADOW || '').toLowerCase() === '1' ||
+  String(process.env.CHAT_HISTORY_SHADOW || '').toLowerCase() === 'true';
+const liveAggregateDelegate =
+  String(process.env.LIVE_AGGREGATE_DELEGATE || '').toLowerCase() === '1' ||
+  String(process.env.LIVE_AGGREGATE_DELEGATE || '').toLowerCase() === 'true';
 const chatInternalApiKey = process.env.CHAT_INTERNAL_API_KEY || '';
+/** When false (default), POST /creators/subscription is rejected — use POST /payments/subscribe for paid subs. */
+const allowFreeSubscription =
+  String(process.env.ALLOW_FREE_SUBSCRIPTION || '').toLowerCase() === '1' ||
+  String(process.env.ALLOW_FREE_SUBSCRIPTION || '').toLowerCase() === 'true';
+
+// Opt-in enforcement for “subscribers-only for all creator posts”.
+// When enabled, `public` / `followers` visibility are treated as subscribers-only for discovery feeds.
+const subscribersOnlyCatalog =
+  String(process.env.SUBSCRIBERS_ONLY_CATALOG || '').toLowerCase() === '1' ||
+  String(process.env.SUBSCRIBERS_ONLY_CATALOG || '').toLowerCase() === 'true';
+
 const livekitUrl = process.env.LIVEKIT_URL || '';
 const livekitApiKey = process.env.LIVEKIT_API_KEY || '';
 const livekitApiSecret = process.env.LIVEKIT_API_SECRET || '';
 const livekitTokenTtlSeconds = Math.max(Number(process.env.LIVEKIT_TOKEN_TTL_SECONDS || 3600), 60);
+
+// MinIO/S3 presigned uploads (S3 SigV4). We avoid extra SDK deps to keep installs simple.
+const minioEndpoint = process.env.MINIO_ENDPOINT || 'http://localhost:19000';
+const minioBucket = process.env.MINIO_BUCKET || 'stripnoir';
+const minioRegion = process.env.MINIO_REGION || 'us-east-1';
+const minioAccessKey = process.env.MINIO_ROOT_USER || '';
+const minioSecretKey = process.env.MINIO_ROOT_PASSWORD || '';
+const minioStorageProvider = process.env.MINIO_STORAGE_PROVIDER || 's3';
+
+function rfc3986Encode(value) {
+  return encodeURIComponent(String(value))
+    .replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function sha256Hex(data) {
+  return crypto.createHash('sha256').update(data, 'utf8').digest('hex');
+}
+
+function hmacSha256(key, data) {
+  return crypto.createHmac('sha256', key).update(data, 'utf8').digest();
+}
+
+function getSignatureKey(secretKey, dateStamp, regionName, serviceName) {
+  const kDate = hmacSha256(`AWS4${secretKey}`, dateStamp);
+  const kRegion = hmacSha256(kDate, regionName);
+  const kService = hmacSha256(kRegion, serviceName);
+  return hmacSha256(kService, 'aws4_request');
+}
+
+function getAmsDateParts() {
+  const iso = new Date().toISOString(); // e.g. 2026-03-25T06:41:00.000Z
+  const amzDate = iso.replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z'); // YYYYMMDDTHHMMSSZ
+  const dateStamp = amzDate.slice(0, 8); // YYYYMMDD
+  return { amzDate, dateStamp };
+}
+
+function encodeObjectKey(objectKey) {
+  // Canonical URI encodes each segment but keeps '/' as path separators.
+  return String(objectKey)
+    .split('/')
+    .map((seg) => rfc3986Encode(seg))
+    .join('/');
+}
+
+function createMinioPresignedPutUrl({ objectKey, contentType, expiresSeconds }) {
+  if (!minioAccessKey || !minioSecretKey) {
+    throw new Error('MINIO_ROOT_USER/MINIO_ROOT_PASSWORD not configured');
+  }
+  const endpointUrl = new URL(minioEndpoint);
+  const protocol = endpointUrl.protocol.replace(/:$/, '');
+  const host = endpointUrl.host; // includes :port when present
+
+  const method = 'PUT';
+  const service = 's3';
+  const region = minioRegion;
+  const { amzDate, dateStamp } = getAmsDateParts();
+
+  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
+  const canonicalUri = `/${rfc3986Encode(minioBucket)}/${encodeObjectKey(objectKey)}`;
+
+  const query = {
+    'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
+    'X-Amz-Credential': `${minioAccessKey}/${credentialScope}`,
+    'X-Amz-Date': amzDate,
+    'X-Amz-Expires': String(expiresSeconds),
+    'X-Amz-SignedHeaders': 'host'
+  };
+
+  const canonicalQueryString = Object.keys(query)
+    .sort()
+    .map((k) => `${rfc3986Encode(k)}=${rfc3986Encode(query[k])}`)
+    .join('&');
+
+  const canonicalHeaders = `host:${host}\n`;
+  const signedHeaders = 'host';
+  const payloadHash = 'UNSIGNED-PAYLOAD';
+
+  const canonicalRequest = [
+    method,
+    canonicalUri,
+    canonicalQueryString,
+    canonicalHeaders,
+    signedHeaders,
+    payloadHash
+  ].join('\n');
+
+  const stringToSign = [
+    'AWS4-HMAC-SHA256',
+    amzDate,
+    credentialScope,
+    sha256Hex(canonicalRequest)
+  ].join('\n');
+
+  const signingKey = getSignatureKey(minioSecretKey, dateStamp, region, service);
+  const signature = hmacSha256(signingKey, stringToSign).toString('hex');
+
+  const finalQueryString = `${canonicalQueryString}&X-Amz-Signature=${rfc3986Encode(signature)}`;
+  const objectPath = `/${rfc3986Encode(minioBucket)}/${encodeObjectKey(objectKey)}`;
+  return `${protocol}://${host}${objectPath}?${finalQueryString}`;
+}
 
 app.use(cors());
 app.use(express.json());
@@ -51,15 +173,27 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/health/deps', async (req, res) => {
-  const [postgres, redis] = await Promise.all([checkPostgres(), checkRedis()]);
-  const allHealthy = postgres.ok && redis.ok;
+  const [postgres, postgresRead, redis] = await Promise.all([
+    checkPostgres(),
+    checkPostgresRead(),
+    checkRedis()
+  ]);
+  const allHealthy = postgres.ok && postgresRead.ok && redis.ok;
+
+  // LiveKit readiness is config/contract-level; we don't gate basic health/deps
+  // because LiveKit may be intentionally disabled for certain environments.
+  const livekit = {
+    configured: isLiveKitConfigured()
+  };
 
   res.status(allHealthy ? 200 : 503).json({
     service: 'api',
     status: allHealthy ? 'ok' : 'degraded',
     dependencies: {
       postgres,
-      redis
+      postgresRead,
+      redis,
+      livekit
     }
   });
 });
@@ -291,6 +425,101 @@ async function hasActiveSubscription(subscriberUserId, creatorId) {
   return subscription.rows.length > 0;
 }
 
+async function userHasContentAccessGrant(userId, contentPostId) {
+  const r = await pool.query(
+    `SELECT 1
+     FROM content_access_grant
+     WHERE content_post_id = $1
+       AND granted_to_user_id = $2
+       AND (expires_at IS NULL OR expires_at > now())
+     LIMIT 1`,
+    [contentPostId, userId]
+  );
+  return r.rows.length > 0;
+}
+
+async function hasContentUnlockLedger(userId, contentPostId) {
+  const r = await pool.query(
+    `SELECT 1
+     FROM credit_ledger
+     WHERE user_id = $1
+       AND direction = 'debit'
+       AND entry_type = 'content_unlock_debit'
+       AND reference_type = 'content_unlock'
+       AND reference_id = $2
+     LIMIT 1`,
+    [userId, contentPostId]
+  );
+  return r.rows.length > 0;
+}
+
+/** Row must include content_post columns plus creator_user_id (from join). */
+async function userCanViewContentPost(userId, row) {
+  if (row.creator_user_id === userId) {
+    return true;
+  }
+  if (row.status !== 'published') {
+    return false;
+  }
+
+  if (row.visibility === 'public') {
+    if (subscribersOnlyCatalog) {
+      return hasActiveSubscription(userId, row.creator_id);
+    }
+    return true;
+  }
+
+  if (row.visibility === 'followers') {
+    if (subscribersOnlyCatalog) {
+      return hasActiveSubscription(userId, row.creator_id);
+    }
+    const follow = await pool.query(
+      `SELECT 1
+       FROM follow_relation
+       WHERE follower_user_id = $1 AND creator_user_id = $2
+       LIMIT 1`,
+      [userId, row.creator_user_id]
+    );
+    return follow.rows.length > 0;
+  }
+
+  const subscribed = await hasActiveSubscription(userId, row.creator_id);
+
+  if (row.visibility === 'subscribers') {
+    return subscribed;
+  }
+
+  if (row.visibility === 'private') {
+    return subscribed;
+  }
+
+  if (row.visibility === 'exclusive_ppv') {
+    if (row.requires_payment) {
+      if (subscribed) {
+        return true;
+      }
+      if (await userHasContentAccessGrant(userId, row.id)) {
+        return true;
+      }
+      if (await hasContentUnlockLedger(userId, row.id)) {
+        return true;
+      }
+      return false;
+    }
+    return subscribed;
+  }
+
+  return false;
+}
+
+async function userHasCreatorProfile(userId) {
+  const r = await pool.query(
+    `SELECT 1 FROM creator_profile WHERE user_id = $1 LIMIT 1`,
+    [userId]
+  );
+  return r.rows.length > 0;
+}
+
 async function ensureWallet(client, userId) {
   await client.query(
     `INSERT INTO wallet_account (user_id)
@@ -485,6 +714,32 @@ async function isRoomParticipant(roomId, userId) {
   return membership.rows.length > 0;
 }
 
+async function areUsersBlocked(userA, userB, db = pool) {
+  const blocked = await db.query(
+    `SELECT 1
+     FROM user_block
+     WHERE (blocker_user_id = $1 AND blocked_user_id = $2)
+        OR (blocker_user_id = $2 AND blocked_user_id = $1)
+     LIMIT 1`,
+    [userA, userB]
+  );
+  return blocked.rows.length > 0;
+}
+
+async function getOtherDirectRoomParticipant(roomId, userId, db = pool) {
+  const result = await db.query(
+    `SELECT u.id::text AS other_user_id
+     FROM chat_room_participant crp
+     INNER JOIN user_account u ON u.id = crp.user_id
+     WHERE crp.room_id = $1
+       AND crp.user_id <> $2
+       AND crp.left_at IS NULL
+     LIMIT 1`,
+    [roomId, userId]
+  );
+  return result.rows[0]?.other_user_id || null;
+}
+
 async function publishChatEvent(roomId, eventType, payload) {
   const body = {
     roomId,
@@ -532,6 +787,78 @@ async function publishNotifyEvent(userId, eventType, payload) {
     const text = await response.text();
     throw new Error(`notify publish failed: ${response.status} ${text}`);
   }
+}
+
+async function delegateChatHistory(req, method, pathAndQuery, jsonBody) {
+  const url = `${chatServiceUrl}${pathAndQuery}`;
+  const headers = {
+    'X-Delegate-User-Id': req.auth.sub
+  };
+  if (chatInternalApiKey) {
+    headers['x-internal-key'] = chatInternalApiKey;
+  }
+  const opts = { method, headers };
+  if (method === 'POST' || method === 'PATCH') {
+    headers['content-type'] = 'application/json';
+    opts.body = JSON.stringify(jsonBody || {});
+  }
+  const response = await fetch(url, opts);
+  const text = await response.text();
+  let body;
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch {
+    body = { error: text };
+  }
+  return { status: response.status, body };
+}
+
+async function shadowChatHistoryCompare(roomId, userId, limit, beforeValue, nodeMessages) {
+  try {
+    const qs = new URLSearchParams({ limit: String(limit) });
+    if (beforeValue) {
+      qs.set('before', beforeValue);
+    }
+    const pathAndQuery = `/internal/history/rooms/${encodeURIComponent(roomId)}/messages?${qs.toString()}`;
+    const headers = {
+      'X-Delegate-User-Id': userId
+    };
+    if (chatInternalApiKey) {
+      headers['x-internal-key'] = chatInternalApiKey;
+    }
+    const r = await fetch(`${chatServiceUrl}${pathAndQuery}`, { method: 'GET', headers });
+    if (!r.ok) {
+      return;
+    }
+    const goData = await r.json();
+    const gLen = Array.isArray(goData.messages) ? goData.messages.length : -1;
+    if (gLen !== nodeMessages.length) {
+      // eslint-disable-next-line no-console
+      console.warn('[chat-history-shadow] message count mismatch', {
+        roomId,
+        node: nodeMessages.length,
+        go: gLen
+      });
+    }
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn('[chat-history-shadow]', e.message);
+  }
+}
+
+async function fetchLiveAggregateFromGo(sessionId) {
+  const headers = {};
+  if (chatInternalApiKey) {
+    headers['x-internal-key'] = chatInternalApiKey;
+  }
+  const r = await fetch(
+    `${chatServiceUrl}/internal/live/sessions/${encodeURIComponent(sessionId)}/aggregate`,
+    { headers }
+  );
+  if (!r.ok) {
+    return null;
+  }
+  return r.json();
 }
 
 async function getLiveSessionById(sessionId, viewerUserId = null, db = pool) {
@@ -1180,6 +1507,69 @@ v1.delete('/users/:id/unfollow', authRequired, async (req, res) => {
   }
 });
 
+// Blocking (chat safety)
+v1.post('/users/:id/block', authRequired, async (req, res) => {
+  const targetUserId = String(req.params.id || '').trim();
+  if (!targetUserId) {
+    return res.status(400).json({ error: 'target user id is required' });
+  }
+  if (targetUserId === req.auth.sub) {
+    return res.status(400).json({ error: 'cannot block yourself' });
+  }
+
+  const reason = req.body?.reason !== undefined ? String(req.body.reason).trim() : null;
+  if (reason && reason.length > 500) {
+    return res.status(400).json({ error: 'reason is too long' });
+  }
+
+  try {
+    const target = await pool.query(
+      `SELECT id
+       FROM user_account
+       WHERE id = $1
+         AND status = 'active'
+       LIMIT 1`,
+      [targetUserId]
+    );
+    if (target.rows.length === 0) {
+      return res.status(404).json({ error: 'user not found' });
+    }
+
+    await pool.query(
+      `INSERT INTO user_block (blocker_user_id, blocked_user_id, reason)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (blocker_user_id, blocked_user_id) DO NOTHING`,
+      [req.auth.sub, targetUserId, reason]
+    );
+
+    return res.status(201).json({ blocked: true });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to block user' });
+  }
+});
+
+v1.delete('/users/:id/block', authRequired, async (req, res) => {
+  const targetUserId = String(req.params.id || '').trim();
+  if (!targetUserId) {
+    return res.status(400).json({ error: 'target user id is required' });
+  }
+  if (targetUserId === req.auth.sub) {
+    return res.status(400).json({ error: 'cannot unblock yourself' });
+  }
+
+  try {
+    const removed = await pool.query(
+      `DELETE FROM user_block
+       WHERE blocker_user_id = $1
+         AND blocked_user_id = $2`,
+      [req.auth.sub, targetUserId]
+    );
+    return res.json({ unblocked: removed.rowCount > 0 });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to unblock user' });
+  }
+});
+
 v1.post('/creators/apply', authRequired, async (req, res) => {
   const stageName = String(req.body?.stageName || '').trim();
   if (!stageName) {
@@ -1306,7 +1696,140 @@ v1.put('/creators/me', authRequired, async (req, res) => {
   }
 });
 
+// Creator onboarding / KYC workflow
+v1.post('/creators/verification/submit', authRequired, async (req, res) => {
+  const mediaAssetIds = Array.isArray(req.body?.mediaAssetIds)
+    ? req.body.mediaAssetIds.map((id) => String(id).trim()).filter(Boolean)
+    : [];
+  const metadata = req.body?.metadata !== undefined ? req.body.metadata : {};
+
+  if (mediaAssetIds.length === 0) {
+    return res.status(400).json({ error: 'mediaAssetIds is required' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const creator = await client.query(
+      `SELECT id
+       FROM creator_profile
+       WHERE user_id = $1
+       LIMIT 1`,
+      [req.auth.sub]
+    );
+    if (creator.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'creator profile required' });
+    }
+
+    const ownedMedia = await client.query(
+      `SELECT id
+       FROM media_asset
+       WHERE id = ANY($1::uuid[])
+         AND owner_user_id = $2`,
+      [mediaAssetIds, req.auth.sub]
+    );
+    if (ownedMedia.rows.length !== mediaAssetIds.length) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'all mediaAssetIds must belong to current user' });
+    }
+
+    const submission = await client.query(
+      `INSERT INTO creator_verification_submission (creator_id, status, metadata)
+       VALUES ($1, 'pending', $2::jsonb)
+       RETURNING id, creator_id, status, submitted_at, reviewed_at, reviewed_by, metadata`,
+      [creator.rows[0].id, JSON.stringify(metadata || {})]
+    );
+
+    const submissionId = submission.rows[0].id;
+    for (let i = 0; i < mediaAssetIds.length; i += 1) {
+      await client.query(
+        `INSERT INTO creator_verification_submission_media (creator_verification_submission_id, media_asset_id, sort_order)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (creator_verification_submission_id, media_asset_id) DO NOTHING`,
+        [submissionId, mediaAssetIds[i], i]
+      );
+    }
+
+    await client.query(
+      `UPDATE creator_profile
+       SET verification_status = 'pending',
+           verified_at = NULL,
+           verified_by = NULL,
+           updated_at = now()
+       WHERE id = $1`,
+      [creator.rows[0].id]
+    );
+
+    await client.query('COMMIT');
+    return res.status(201).json({ submission: submission.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: 'failed to submit verification' });
+  } finally {
+    client.release();
+  }
+});
+
+v1.get('/creators/verification/status', authRequired, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT cp.verification_status,
+              cp.verified_at,
+              cp.verified_by,
+              s.id AS submission_id,
+              s.status AS submission_status,
+              s.submitted_at,
+              s.reviewed_at,
+              s.reviewed_by,
+              s.metadata
+       FROM creator_profile cp
+       LEFT JOIN LATERAL (
+         SELECT id, status, submitted_at, reviewed_at, reviewed_by, metadata
+         FROM creator_verification_submission
+         WHERE creator_id = cp.id
+         ORDER BY submitted_at DESC
+         LIMIT 1
+       ) s ON TRUE
+       WHERE cp.user_id = $1
+       LIMIT 1`,
+      [req.auth.sub]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(403).json({ error: 'creator profile required' });
+    }
+
+    const row = result.rows[0];
+    return res.json({
+      verificationStatus: row.verification_status,
+      verifiedAt: row.verified_at,
+      verifiedBy: row.verified_by,
+      submission: row.submission_id
+        ? {
+            id: row.submission_id,
+            status: row.submission_status,
+            submittedAt: row.submitted_at,
+            reviewedAt: row.reviewed_at,
+            reviewedBy: row.reviewed_by,
+            metadata: row.metadata
+          }
+        : null
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to fetch verification status' });
+  }
+});
+
 v1.post('/creators/subscription', authRequired, async (req, res) => {
+  if (!allowFreeSubscription) {
+    return res.status(403).json({
+      error:
+        'free subscription path disabled; use POST /api/v1/payments/subscribe with credits, or set ALLOW_FREE_SUBSCRIPTION=1 for development'
+    });
+  }
+
   const creatorId = String(req.body?.creatorId || '').trim();
   if (!creatorId) {
     return res.status(400).json({ error: 'creatorId is required' });
@@ -1408,10 +1931,23 @@ v1.delete('/creators/:id/subscription', authRequired, async (req, res) => {
 
 v1.post('/media/upload-url', authRequired, async (req, res) => {
   const objectKey = `uploads/${req.auth.sub}/${crypto.randomUUID()}`;
+  const contentType = String(req.body?.contentType || req.query?.contentType || 'application/octet-stream');
+  let uploadUrl;
+  try {
+    uploadUrl = createMinioPresignedPutUrl({
+      objectKey,
+      contentType,
+      expiresSeconds: 900
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to create presigned upload URL', details: error.message });
+  }
   return res.json({
     objectKey,
-    uploadUrl: `https://upload.local/${objectKey}`,
-    expiresInSeconds: 900
+    uploadUrl,
+    expiresInSeconds: 900,
+    storageBucket: minioBucket,
+    storageProvider: minioStorageProvider
   });
 });
 
@@ -1427,6 +1963,13 @@ v1.post('/media/complete', authRequired, async (req, res) => {
     return res.status(400).json({ error: 'invalid mediaType' });
   }
 
+  const storageProvider = req.body?.storageProvider
+    ? String(req.body.storageProvider).trim()
+    : minioStorageProvider;
+  const storageBucket = req.body?.storageBucket
+    ? String(req.body.storageBucket).trim()
+    : minioBucket;
+
   try {
     const inserted = await pool.query(
       `INSERT INTO media_asset (
@@ -1438,8 +1981,8 @@ v1.post('/media/complete', authRequired, async (req, res) => {
       [
         req.auth.sub,
         mediaType,
-        req.body?.storageProvider ? String(req.body.storageProvider).trim() : null,
-        req.body?.storageBucket ? String(req.body.storageBucket).trim() : null,
+        storageProvider || null,
+        storageBucket || null,
         objectKey,
         req.body?.originalFilename ? String(req.body.originalFilename).trim() : null,
         req.body?.mimeType ? String(req.body.mimeType).trim() : null,
@@ -1472,21 +2015,107 @@ v1.get('/media/:id', authRequired, async (req, res) => {
       return res.status(404).json({ error: 'media not found' });
     }
     const media = result.rows[0];
-    if (!media.is_public && media.owner_user_id !== req.auth.sub) {
-      return res.status(403).json({ error: 'forbidden' });
+    if (media.is_public || media.owner_user_id === req.auth.sub) {
+      return res.json({ media });
     }
-    return res.json({ media });
+
+    const posts = await pool.query(
+      `SELECT cp.*, c.user_id AS creator_user_id
+       FROM content_post_media cpm
+       INNER JOIN content_post cp ON cp.id = cpm.content_post_id
+       INNER JOIN creator_profile c ON c.id = cp.creator_id
+       WHERE cpm.media_asset_id = $1`,
+      [mediaId]
+    );
+    for (const row of posts.rows) {
+      if (await userCanViewContentPost(req.auth.sub, row)) {
+        return res.json({ media });
+      }
+    }
+
+    const subExclusive = await pool.query(
+      `SELECT sec.*, c.user_id AS creator_user_id
+       FROM subscription_exclusive_content_media secm
+       INNER JOIN subscription_exclusive_content sec ON sec.id = secm.subscription_exclusive_content_id
+       INNER JOIN creator_profile c ON c.id = sec.creator_id
+       WHERE secm.media_asset_id = $1`,
+      [mediaId]
+    );
+    for (const row of subExclusive.rows) {
+      const isOwner = row.creator_user_id === req.auth.sub;
+      if (isOwner) {
+        return res.json({ media });
+      }
+      if (row.status === 'published' && (await hasActiveSubscription(req.auth.sub, row.creator_id))) {
+        return res.json({ media });
+      }
+    }
+
+    return res.status(403).json({ error: 'forbidden' });
   } catch (error) {
     return res.status(500).json({ error: 'failed to fetch media' });
   }
 });
 
+v1.delete('/media/:id', authRequired, async (req, res) => {
+  const mediaId = req.params.id;
+
+  try {
+    const used = await pool.query(
+      `SELECT 1
+       FROM content_post_media
+       WHERE media_asset_id = $1
+       LIMIT 1`,
+      [mediaId]
+    );
+    if (used.rows.length > 0) {
+      return res.status(409).json({ error: 'media is attached to content; remove it from posts first' });
+    }
+    const usedSub = await pool.query(
+      `SELECT 1
+       FROM subscription_exclusive_content_media
+       WHERE media_asset_id = $1
+       LIMIT 1`,
+      [mediaId]
+    );
+    if (usedSub.rows.length > 0) {
+      return res.status(409).json({ error: 'media is attached to subscription content; remove it first' });
+    }
+
+    const removed = await pool.query(
+      `DELETE FROM media_asset
+       WHERE id = $1 AND owner_user_id = $2
+       RETURNING id`,
+      [mediaId, req.auth.sub]
+    );
+    if (removed.rows.length === 0) {
+      return res.status(404).json({ error: 'media not found' });
+    }
+    return res.json({ deleted: true, mediaId });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to delete media' });
+  }
+});
+
 v1.post('/content/upload-url', authRequired, async (req, res) => {
   const objectKey = `content/${req.auth.sub}/${crypto.randomUUID()}`;
+  const contentType = String(req.body?.contentType || req.query?.contentType || 'application/octet-stream');
+  let uploadUrl;
+  try {
+    uploadUrl = createMinioPresignedPutUrl({
+      objectKey,
+      contentType,
+      expiresSeconds: 900
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to create presigned upload URL', details: error.message });
+  }
   return res.json({
     objectKey,
-    uploadUrl: `https://upload.local/${objectKey}`,
-    expiresInSeconds: 900
+    uploadUrl,
+    expiresInSeconds: 900,
+    storageBucket: minioBucket,
+    storageProvider: minioStorageProvider
   });
 });
 
@@ -1597,35 +2226,7 @@ v1.get('/content/:id', authRequired, async (req, res) => {
     }
     const content = result.rows[0];
 
-    let hasAccess = content.creator_user_id === req.auth.sub;
-    if (!hasAccess) {
-      if (content.status !== 'published') {
-        return res.status(403).json({ error: 'content is not published' });
-      }
-
-      if (content.visibility === 'public') {
-        hasAccess = true;
-      } else if (content.visibility === 'followers') {
-        const follow = await pool.query(
-          `SELECT 1 FROM follow_relation WHERE follower_user_id = $1 AND creator_user_id = $2 LIMIT 1`,
-          [req.auth.sub, content.creator_user_id]
-        );
-        hasAccess = follow.rows.length > 0;
-      } else if (content.visibility === 'subscribers') {
-        const subscription = await pool.query(
-          `SELECT 1
-           FROM subscription
-           WHERE subscriber_user_id = $1
-             AND creator_id = $2
-             AND status = 'active'
-             AND (current_period_end IS NULL OR current_period_end > now())
-           LIMIT 1`,
-          [req.auth.sub, content.creator_id]
-        );
-        hasAccess = subscription.rows.length > 0;
-      }
-    }
-
+    const hasAccess = await userCanViewContentPost(req.auth.sub, content);
     if (!hasAccess) {
       return res.status(403).json({ error: 'forbidden' });
     }
@@ -1645,6 +2246,191 @@ v1.get('/content/:id', authRequired, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({ error: 'failed to fetch content' });
+  }
+});
+
+v1.patch('/content/:id', authRequired, async (req, res) => {
+  const contentId = req.params.id;
+  const allowedVisibility = new Set(['public', 'followers', 'subscribers', 'exclusive_ppv', 'private']);
+  const allowedStatus = new Set(['draft', 'published', 'archived', 'deleted']);
+
+  if (req.body === null || typeof req.body !== 'object') {
+    return res.status(400).json({ error: 'invalid body' });
+  }
+
+  const canPatch = [
+    'title',
+    'caption',
+    'visibility',
+    'status',
+    'requiresPayment',
+    'unlockPriceCredits',
+    'metadata'
+  ].some((k) => Object.prototype.hasOwnProperty.call(req.body, k));
+  if (!canPatch) {
+    return res.status(400).json({ error: 'no valid fields to update' });
+  }
+
+  try {
+    const cur = await pool.query(
+      `SELECT cp.*
+       FROM content_post cp
+       INNER JOIN creator_profile c ON c.id = cp.creator_id
+       WHERE cp.id = $1 AND c.user_id = $2`,
+      [contentId, req.auth.sub]
+    );
+    if (cur.rows.length === 0) {
+      return res.status(404).json({ error: 'content not found' });
+    }
+    const row = cur.rows[0];
+
+    let title = row.title;
+    if (req.body.title !== undefined) {
+      title = req.body.title === null ? null : String(req.body.title).trim();
+    }
+    let caption = row.caption;
+    if (req.body.caption !== undefined) {
+      caption = req.body.caption === null ? null : String(req.body.caption).trim();
+    }
+    let visibility = row.visibility;
+    if (req.body.visibility !== undefined) {
+      const v = String(req.body.visibility || '').trim();
+      if (!allowedVisibility.has(v)) {
+        return res.status(400).json({ error: 'invalid visibility' });
+      }
+      visibility = v;
+    }
+    let status = row.status;
+    if (req.body.status !== undefined) {
+      const s = String(req.body.status || '').trim();
+      if (!allowedStatus.has(s)) {
+        return res.status(400).json({ error: 'invalid status' });
+      }
+      status = s;
+    }
+    let requiresPayment = row.requires_payment;
+    if (req.body.requiresPayment !== undefined) {
+      requiresPayment = Boolean(req.body.requiresPayment);
+    }
+    let unlockPriceCredits = Number(row.unlock_price_credits || 0);
+    if (req.body.unlockPriceCredits !== undefined) {
+      unlockPriceCredits = Math.max(0, Number(req.body.unlockPriceCredits) || 0);
+    }
+    if (!requiresPayment) {
+      unlockPriceCredits = 0;
+    } else if (unlockPriceCredits <= 0) {
+      return res.status(400).json({ error: 'unlockPriceCredits must be > 0 when requiresPayment is true' });
+    }
+
+    let metadata = row.metadata;
+    if (req.body.metadata !== undefined) {
+      metadata = req.body.metadata === null ? {} : req.body.metadata;
+    }
+
+    const updated = await pool.query(
+      `UPDATE content_post
+       SET title = $1,
+           caption = $2,
+           visibility = $3::content_visibility,
+           status = $4::content_status,
+           requires_payment = $5,
+           unlock_price_credits = $6,
+           metadata = COALESCE($7::jsonb, '{}'::jsonb),
+           published_at = CASE
+             WHEN $4::content_status = 'published' AND published_at IS NULL THEN now()
+             ELSE published_at
+           END,
+           updated_at = now()
+       WHERE id = $8
+       RETURNING *`,
+      [
+        title,
+        caption,
+        visibility,
+        status,
+        requiresPayment,
+        unlockPriceCredits,
+        JSON.stringify(metadata),
+        contentId
+      ]
+    );
+
+    return res.json({ content: sanitizeContent(updated.rows[0]) });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to update content' });
+  }
+});
+
+v1.post('/content/:id/unlock', authRequired, async (req, res) => {
+  const contentId = req.params.id;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      `SELECT cp.*, c.user_id AS creator_user_id
+       FROM content_post cp
+       INNER JOIN creator_profile c ON c.id = cp.creator_id
+       WHERE cp.id = $1
+       LIMIT 1
+       FOR UPDATE`,
+      [contentId]
+    );
+    if (result.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'content not found' });
+    }
+    const content = result.rows[0];
+    if (content.creator_user_id === req.auth.sub) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'owner does not need to unlock' });
+    }
+    if (content.status !== 'published' || content.visibility !== 'exclusive_ppv' || !content.requires_payment) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'content is not unlockable via PPV' });
+    }
+    const price = Number(content.unlock_price_credits || 0);
+    if (price <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'invalid unlock price' });
+    }
+
+    if (await userCanViewContentPost(req.auth.sub, content)) {
+      await client.query('COMMIT');
+      return res.status(200).json({ alreadyUnlocked: true, content: sanitizeContent(content) });
+    }
+
+    await ensureWallet(client, req.auth.sub);
+    await ensureWallet(client, content.creator_user_id);
+
+    const transfer = await transferCredits({
+      client,
+      fromUserId: req.auth.sub,
+      toUserId: content.creator_user_id,
+      amountCredits: price,
+      debitEntryType: 'content_unlock_debit',
+      creditEntryType: 'content_unlock_credit',
+      referenceType: 'content_unlock',
+      referenceId: content.id
+    });
+
+    await client.query(
+      `INSERT INTO content_access_grant (content_post_id, granted_to_user_id, grant_source, granted_by_user_id)
+       VALUES ($1, $2, 'ppv_unlock', NULL)
+       ON CONFLICT (content_post_id, granted_to_user_id)
+       DO UPDATE SET grant_source = EXCLUDED.grant_source, created_at = now()`,
+      [content.id, req.auth.sub]
+    );
+
+    await client.query('COMMIT');
+    return res.status(201).json({ content: sanitizeContent(content), transfer });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    if (error && error.code === 'INSUFFICIENT_CREDITS') {
+      return res.status(402).json({ error: 'insufficient credits to unlock' });
+    }
+    return res.status(500).json({ error: 'failed to unlock content' });
+  } finally {
+    client.release();
   }
 });
 
@@ -1692,9 +2478,17 @@ v1.get('/creators/:id/content', authRequired, async (req, res) => {
        FROM content_post
        WHERE creator_id = $1
          AND ($2::boolean = TRUE OR status = 'published')
+         AND ($4::boolean = FALSE OR $2::boolean = TRUE OR EXISTS (
+           SELECT 1
+           FROM subscription s
+           WHERE s.subscriber_user_id = $5::uuid
+             AND s.creator_id = content_post.creator_id
+             AND s.status = 'active'
+             AND (s.current_period_end IS NULL OR s.current_period_end > now())
+         ))
        ORDER BY COALESCE(published_at, created_at) DESC
        LIMIT $3`,
-      [creatorId, isOwner, limit]
+      [creatorId, isOwner, limit, subscribersOnlyCatalog, req.auth.sub]
     );
 
     return res.json({ content: result.rows.map(sanitizeContent) });
@@ -1705,10 +2499,23 @@ v1.get('/creators/:id/content', authRequired, async (req, res) => {
 
 v1.post('/subscription-content/upload-url', authRequired, async (req, res) => {
   const objectKey = `subscription-content/${req.auth.sub}/${crypto.randomUUID()}`;
+  const contentType = String(req.body?.contentType || req.query?.contentType || 'application/octet-stream');
+  let uploadUrl;
+  try {
+    uploadUrl = createMinioPresignedPutUrl({
+      objectKey,
+      contentType,
+      expiresSeconds: 900
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to create presigned upload URL', details: error.message });
+  }
   return res.json({
     objectKey,
-    uploadUrl: `https://upload.local/${objectKey}`,
-    expiresInSeconds: 900
+    uploadUrl,
+    expiresInSeconds: 900,
+    storageBucket: minioBucket,
+    storageProvider: minioStorageProvider
   });
 });
 
@@ -1834,6 +2641,82 @@ v1.get('/subscription-content/:id', authRequired, async (req, res) => {
   }
 });
 
+v1.patch('/subscription-content/:id', authRequired, async (req, res) => {
+  const contentId = req.params.id;
+
+  if (req.body === null || typeof req.body !== 'object') {
+    return res.status(400).json({ error: 'invalid body' });
+  }
+
+  const canPatch = [
+    'title',
+    'caption',
+    'status',
+    'metadata'
+  ].some((k) => Object.prototype.hasOwnProperty.call(req.body, k));
+
+  if (!canPatch) {
+    return res.status(400).json({ error: 'no valid fields to update' });
+  }
+
+  const allowedStatus = new Set(['draft', 'published', 'archived', 'deleted']);
+  if (req.body.status !== undefined) {
+    const s = String(req.body.status || '').trim();
+    if (!allowedStatus.has(s)) {
+      return res.status(400).json({ error: 'invalid status' });
+    }
+  }
+
+  try {
+    const cur = await pool.query(
+      `SELECT sec.*
+       FROM subscription_exclusive_content sec
+       INNER JOIN creator_profile c ON c.id = sec.creator_id
+       WHERE sec.id = $1
+         AND c.user_id = $2
+       LIMIT 1`,
+      [contentId, req.auth.sub]
+    );
+
+    if (cur.rows.length === 0) {
+      return res.status(404).json({ error: 'subscription content not found' });
+    }
+
+    const row = cur.rows[0];
+    const title = req.body.title !== undefined
+      ? (req.body.title === null ? null : String(req.body.title).trim())
+      : row.title;
+    const caption = req.body.caption !== undefined
+      ? (req.body.caption === null ? null : String(req.body.caption).trim())
+      : row.caption;
+    const status = req.body.status !== undefined ? String(req.body.status).trim() : row.status;
+    const metadata = req.body.metadata !== undefined
+      ? (req.body.metadata === null ? {} : req.body.metadata)
+      : row.metadata;
+
+    const publishedAt = status === 'published'
+      ? (row.published_at || new Date())
+      : null;
+
+    const updated = await pool.query(
+      `UPDATE subscription_exclusive_content
+       SET title = $1,
+           caption = $2,
+           status = $3::content_status,
+           published_at = $4::timestamptz,
+           metadata = COALESCE($5::jsonb, '{}'::jsonb),
+           updated_at = now()
+       WHERE id = $6
+       RETURNING *`,
+      [title, caption, status, publishedAt, JSON.stringify(metadata), contentId]
+    );
+
+    return res.json({ content: sanitizeSubscriptionExclusiveContent(updated.rows[0]) });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to update subscription content' });
+  }
+});
+
 v1.delete('/subscription-content/:id', authRequired, async (req, res) => {
   const contentId = req.params.id;
 
@@ -1908,9 +2791,17 @@ v1.get('/feed', authRequired, async (req, res) => {
        INNER JOIN follow_relation fr ON fr.creator_user_id = c.user_id
        WHERE fr.follower_user_id = $1
          AND cp.status = 'published'
+         AND ($3::boolean = FALSE OR EXISTS (
+           SELECT 1
+           FROM subscription s
+           WHERE s.subscriber_user_id = $1::uuid
+             AND s.creator_id = cp.creator_id
+             AND s.status = 'active'
+             AND (s.current_period_end IS NULL OR s.current_period_end > now())
+         ))
        ORDER BY cp.published_at DESC NULLS LAST, cp.created_at DESC
        LIMIT $2`,
-      [req.auth.sub, limit]
+      [req.auth.sub, limit, subscribersOnlyCatalog]
     );
     return res.json({ feed: result.rows.map(sanitizeContent) });
   } catch (error) {
@@ -1929,9 +2820,17 @@ v1.get('/feed/following', authRequired, async (req, res) => {
        INNER JOIN follow_relation fr ON fr.creator_user_id = c.user_id
        WHERE fr.follower_user_id = $1
          AND cp.status = 'published'
+         AND ($3::boolean = FALSE OR EXISTS (
+           SELECT 1
+           FROM subscription s
+           WHERE s.subscriber_user_id = $1::uuid
+             AND s.creator_id = cp.creator_id
+             AND s.status = 'active'
+             AND (s.current_period_end IS NULL OR s.current_period_end > now())
+         ))
        ORDER BY cp.published_at DESC NULLS LAST, cp.created_at DESC
        LIMIT $2`,
-      [req.auth.sub, limit]
+      [req.auth.sub, limit, subscribersOnlyCatalog]
     );
     return res.json({ feed: result.rows.map(sanitizeContent) });
   } catch (error) {
@@ -1948,15 +2847,99 @@ v1.get('/feed/trending', authRequired, async (req, res) => {
        FROM content_post cp
        LEFT JOIN content_post_media cpm ON cpm.content_post_id = cp.id
        WHERE cp.status = 'published'
-         AND cp.visibility IN ('public', 'followers')
+         AND (
+           ($3::boolean = FALSE AND cp.visibility IN ('public', 'followers'))
+           OR ($3::boolean = TRUE)
+         )
+         AND ($3::boolean = FALSE OR EXISTS (
+           SELECT 1
+           FROM subscription s
+           WHERE s.subscriber_user_id = $1::uuid
+             AND s.creator_id = cp.creator_id
+             AND s.status = 'active'
+             AND (s.current_period_end IS NULL OR s.current_period_end > now())
+         ))
        GROUP BY cp.id
        ORDER BY COUNT(cpm.media_asset_id) DESC, cp.published_at DESC NULLS LAST
-       LIMIT $1`,
-      [limit]
+       LIMIT $2`,
+      [req.auth.sub, limit, subscribersOnlyCatalog]
     );
     return res.json({ feed: result.rows.map(sanitizeContent) });
   } catch (error) {
     return res.status(500).json({ error: 'failed to fetch trending feed' });
+  }
+});
+
+/** Home / discovery: browse creators with subscription price and subscriber counts. */
+v1.get('/feed/creators', authRequired, async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit || 20), 1), 100);
+  const offset = Math.min(Math.max(Number(req.query.offset || 0), 0), 10000);
+  const search = req.query?.search ? String(req.query.search).trim() : null;
+  const category = req.query?.category ? String(req.query.category).trim() : null;
+  const verificationStatus = req.query?.verification_status ? String(req.query.verification_status).trim() : null;
+
+  const allowedVerificationStatuses = new Set(['pending', 'approved', 'rejected']);
+  if (verificationStatus && !allowedVerificationStatuses.has(verificationStatus)) {
+    return res.status(400).json({ error: 'invalid verification_status (pending, approved, rejected)' });
+  }
+
+  const searchPattern = search ? `%${search}%` : null;
+
+  try {
+    const result = await pool.query(
+      `SELECT cp.*, ua.username, ua.display_name, ua.avatar_url, ua.bio,
+              (SELECT COUNT(*)::int
+               FROM subscription s
+               WHERE s.creator_id = cp.id
+                 AND s.status = 'active'
+                 AND (s.current_period_end IS NULL OR s.current_period_end > now())) AS active_subscriber_count,
+              EXISTS (
+                SELECT 1 FROM follow_relation fr
+                WHERE fr.follower_user_id = $1::uuid AND fr.creator_user_id = cp.user_id
+              ) AS viewer_is_following,
+              EXISTS (
+                SELECT 1 FROM subscription sv
+                WHERE sv.subscriber_user_id = $1::uuid AND sv.creator_id = cp.id
+                  AND sv.status = 'active'
+                  AND (sv.current_period_end IS NULL OR sv.current_period_end > now())
+              ) AS viewer_is_subscribed
+       FROM creator_profile cp
+       INNER JOIN user_account ua ON ua.id = cp.user_id
+       WHERE ua.status = 'active'
+         AND cp.user_id <> $1::uuid
+         AND ($4::text IS NULL OR cp.verification_status::text = $4::text)
+         AND ($5::text IS NULL OR ua.username ILIKE $5::text OR ua.display_name ILIKE $5::text OR cp.stage_name ILIKE $5::text OR cp.about ILIKE $5::text)
+         AND ($6::text IS NULL OR EXISTS (
+           SELECT 1
+           FROM unnest(cp.category_tags) t
+           WHERE lower(t) = lower($6::text)
+         ))
+       ORDER BY active_subscriber_count DESC, cp.updated_at DESC NULLS LAST, cp.created_at DESC
+       LIMIT $2 OFFSET $3`,
+      [req.auth.sub, limit, offset, verificationStatus, searchPattern, category]
+    );
+
+    return res.json({
+      creators: result.rows.map((row) => ({
+        creator: {
+          ...sanitizeCreator(row),
+          username: row.username,
+          displayName: row.display_name,
+          avatarUrl: row.avatar_url,
+          bio: row.bio
+        },
+        stats: {
+          activeSubscribers: Number(row.active_subscriber_count || 0),
+          subscriptionPriceCredits: Number(row.default_subscription_price_credits || 0)
+        },
+        viewer: {
+          isFollowing: Boolean(row.viewer_is_following),
+          isSubscribed: Boolean(row.viewer_is_subscribed)
+        }
+      }))
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to fetch creator discovery feed' });
   }
 });
 
@@ -2331,8 +3314,8 @@ v1.get('/notifications/ws-token', authRequired, async (req, res) => {
   const token = jwt.sign({ sub: req.auth.sub, typ: 'notify' }, accessTokenSecret, { expiresIn: '15m' });
   return res.json({
     token,
-    wsUrl: `${chatServiceUrl}/ws?token=${encodeURIComponent(token)}`,
-    longPollUrl: `${chatServiceUrl}/realtime/notify/events?token=${encodeURIComponent(token)}`
+    wsUrl: `${chatPublicUrl}/ws?token=${encodeURIComponent(token)}`,
+    longPollUrl: `${chatPublicUrl}/realtime/notify/events?token=${encodeURIComponent(token)}`
   });
 });
 
@@ -2408,6 +3391,162 @@ v1.get('/admin/creators', authRequired, async (req, res) => {
   }
 });
 
+v1.get('/admin/creator-verifications', authRequired, async (req, res) => {
+  if (req.auth.role !== 'admin') {
+    return res.status(403).json({ error: 'admin access required' });
+  }
+
+  const status = req.query?.status ? String(req.query.status).trim() : null;
+  const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 200);
+  const offset = Math.min(Math.max(Number(req.query.offset || 0), 0), 100000);
+
+  try {
+    const result = await pool.query(
+      `SELECT s.id,
+              s.creator_id,
+              s.status,
+              s.submitted_at,
+              s.reviewed_at,
+              s.reviewed_by,
+              s.metadata,
+              cp.user_id AS creator_user_id,
+              ua.username,
+              ua.display_name,
+              cp.stage_name
+       FROM creator_verification_submission s
+       INNER JOIN creator_profile cp ON cp.id = s.creator_id
+       INNER JOIN user_account ua ON ua.id = cp.user_id
+       WHERE ($1::text IS NULL OR s.status::text = $1::text)
+       ORDER BY s.submitted_at DESC
+       LIMIT $2
+       OFFSET $3`,
+      [status, limit, offset]
+    );
+
+    return res.json({
+      submissions: result.rows.map((row) => ({
+        id: row.id,
+        creatorId: row.creator_id,
+        status: row.status,
+        submittedAt: row.submitted_at,
+        reviewedAt: row.reviewed_at,
+        reviewedBy: row.reviewed_by,
+        metadata: row.metadata,
+        creator: {
+          userId: row.creator_user_id,
+          username: row.username,
+          displayName: row.display_name,
+          stageName: row.stage_name
+        }
+      }))
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to fetch creator verifications' });
+  }
+});
+
+v1.post('/admin/creator-verifications/:submissionId/approve', authRequired, async (req, res) => {
+  if (req.auth.role !== 'admin') {
+    return res.status(403).json({ error: 'admin access required' });
+  }
+
+  const submissionId = req.params.submissionId;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const submission = await client.query(
+      `SELECT id, creator_id
+       FROM creator_verification_submission
+       WHERE id = $1
+       LIMIT 1`,
+      [submissionId]
+    );
+    if (submission.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'verification submission not found' });
+    }
+
+    await client.query(
+      `UPDATE creator_verification_submission
+       SET status = 'approved',
+           reviewed_at = now(),
+           reviewed_by = $2
+       WHERE id = $1`,
+      [submissionId, req.auth.sub]
+    );
+
+    await client.query(
+      `UPDATE creator_profile
+       SET verification_status = 'approved',
+           verified_at = now(),
+           verified_by = $2,
+           updated_at = now()
+       WHERE id = $1`,
+      [submission.rows[0].creator_id, req.auth.sub]
+    );
+
+    await client.query('COMMIT');
+    return res.json({ approved: true, submissionId });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: 'failed to approve verification' });
+  } finally {
+    client.release();
+  }
+});
+
+v1.post('/admin/creator-verifications/:submissionId/reject', authRequired, async (req, res) => {
+  if (req.auth.role !== 'admin') {
+    return res.status(403).json({ error: 'admin access required' });
+  }
+
+  const submissionId = req.params.submissionId;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const submission = await client.query(
+      `SELECT id, creator_id
+       FROM creator_verification_submission
+       WHERE id = $1
+       LIMIT 1`,
+      [submissionId]
+    );
+    if (submission.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'verification submission not found' });
+    }
+
+    await client.query(
+      `UPDATE creator_verification_submission
+       SET status = 'rejected',
+           reviewed_at = now(),
+           reviewed_by = $2
+       WHERE id = $1`,
+      [submissionId, req.auth.sub]
+    );
+
+    await client.query(
+      `UPDATE creator_profile
+       SET verification_status = 'rejected',
+           verified_at = NULL,
+           verified_by = NULL,
+           updated_at = now()
+       WHERE id = $1`,
+      [submission.rows[0].creator_id]
+    );
+
+    await client.query('COMMIT');
+    return res.json({ rejected: true, submissionId });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: 'failed to reject verification' });
+  } finally {
+    client.release();
+  }
+});
+
 v1.post('/admin/ban-user', authRequired, async (req, res) => {
   if (req.auth.role !== 'admin') {
     return res.status(403).json({ error: 'admin access required' });
@@ -2435,6 +3574,184 @@ v1.post('/admin/ban-user', authRequired, async (req, res) => {
   }
 });
 
+v1.get('/admin/moderation/reports', authRequired, async (req, res) => {
+  if (!new Set(['admin', 'moderator']).has(req.auth.role)) {
+    return res.status(403).json({ error: 'admin or moderator access required' });
+  }
+
+  const status = req.query?.status ? String(req.query.status).trim() : 'open';
+  const targetType = req.query?.targetType ? String(req.query.targetType).trim() : 'message';
+  const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 200);
+  const offset = Math.min(Math.max(Number(req.query.offset || 0), 0), 100000);
+
+  const allowedStatuses = new Set(['open', 'in_review', 'resolved', 'dismissed']);
+  if (!allowedStatuses.has(status)) {
+    return res.status(400).json({ error: 'invalid status' });
+  }
+
+  const allowedTargetTypes = new Set(['user', 'content', 'message', 'live_session', 'video_call_session']);
+  if (!allowedTargetTypes.has(targetType)) {
+    return res.status(400).json({ error: 'invalid targetType' });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT mr.id,
+              mr.reporter_user_id,
+              ua.username,
+              ua.display_name,
+              mr.target_type::text AS target_type,
+              mr.target_id::text AS target_id,
+              mr.reason_code,
+              mr.reason_text,
+              mr.status::text AS status,
+              mr.priority,
+              mr.assigned_to::text AS assigned_to,
+              mr.created_at,
+              mr.resolved_at
+       FROM moderation_report mr
+       INNER JOIN user_account ua ON ua.id = mr.reporter_user_id
+       WHERE mr.status::text = $1::text
+         AND mr.target_type::text = $2::text
+       ORDER BY mr.priority ASC, mr.created_at DESC
+       LIMIT $3 OFFSET $4`,
+      [status, targetType, limit, offset]
+    );
+
+    return res.json({
+      reports: result.rows.map((row) => ({
+        id: row.id,
+        reporterUserId: row.reporter_user_id,
+        reporter: { username: row.username, displayName: row.display_name },
+        target: { type: row.target_type, id: row.target_id },
+        reasonCode: row.reason_code,
+        reasonText: row.reason_text,
+        status: row.status,
+        priority: Number(row.priority),
+        assignedTo: row.assigned_to,
+        createdAt: row.created_at,
+        resolvedAt: row.resolved_at
+      }))
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to fetch moderation reports' });
+  }
+});
+
+v1.post('/admin/moderation/reports/:reportId/action', authRequired, async (req, res) => {
+  if (!new Set(['admin', 'moderator']).has(req.auth.role)) {
+    return res.status(403).json({ error: 'admin or moderator access required' });
+  }
+
+  const reportId = String(req.params.reportId || '').trim();
+  const actionType = req.body?.actionType ? String(req.body.actionType).trim() : '';
+  const reason = req.body?.reason !== undefined ? String(req.body.reason).trim() : null;
+  const expiresInSeconds = req.body?.expiresInSeconds !== undefined ? Number(req.body.expiresInSeconds) : null;
+
+  const allowedActions = new Set(['hide_content', 'remove_content']);
+  if (!reportId) {
+    return res.status(400).json({ error: 'reportId is required' });
+  }
+  if (!allowedActions.has(actionType)) {
+    return res.status(400).json({ error: 'invalid actionType' });
+  }
+  if (reason && reason.length > 2000) {
+    return res.status(400).json({ error: 'reason is too long' });
+  }
+  if (expiresInSeconds !== null && (!Number.isInteger(expiresInSeconds) || expiresInSeconds <= 0)) {
+    return res.status(400).json({ error: 'expiresInSeconds must be a positive integer' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const report = await client.query(
+      `SELECT id, target_type::text AS target_type, target_id::text AS target_id
+       FROM moderation_report
+       WHERE id = $1
+       LIMIT 1`,
+      [reportId]
+    );
+    if (report.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'report not found' });
+    }
+
+    await client.query(
+      `INSERT INTO moderation_action (
+         report_id,
+         actor_admin_user_id,
+         target_type,
+         target_id,
+         action_type,
+         reason,
+         expires_at
+       )
+       VALUES (
+         $1::uuid,
+         $2::uuid,
+         $3::moderation_target_type,
+         $4::uuid,
+         $5::moderation_action_type,
+         $6::text,
+         CASE
+           WHEN $7::int IS NULL THEN NULL
+           ELSE now() + ($7::int * interval '1 second')
+         END
+       )`,
+      [reportId, req.auth.sub, report.rows[0].target_type, report.rows[0].target_id, actionType, reason, expiresInSeconds]
+    );
+
+    await client.query(
+      `UPDATE moderation_report
+       SET status = 'resolved',
+           assigned_to = $2::uuid,
+           resolved_at = now(),
+           updated_at = now()
+       WHERE id = $1::uuid`,
+      [reportId, req.auth.sub]
+    );
+
+    await client.query('COMMIT');
+    return res.json({ resolved: true, reportId });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    return res.status(500).json({ error: 'failed to apply moderation action' });
+  } finally {
+    client.release();
+  }
+});
+
+v1.post('/admin/moderation/reports/:reportId/dismiss', authRequired, async (req, res) => {
+  if (!new Set(['admin', 'moderator']).has(req.auth.role)) {
+    return res.status(403).json({ error: 'admin or moderator access required' });
+  }
+
+  const reportId = String(req.params.reportId || '').trim();
+  if (!reportId) {
+    return res.status(400).json({ error: 'reportId is required' });
+  }
+
+  try {
+    const updated = await pool.query(
+      `UPDATE moderation_report
+       SET status = 'dismissed',
+           resolved_at = now(),
+           updated_at = now()
+       WHERE id = $1::uuid
+       RETURNING id`,
+      [reportId]
+    );
+    if (updated.rows.length === 0) {
+      return res.status(404).json({ error: 'report not found' });
+    }
+    return res.json({ dismissed: true, reportId });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to dismiss report' });
+  }
+});
+
 v1.get('/chat/ws-token', authRequired, async (req, res) => {
   const roomId = String(req.query.roomId || '');
   if (!roomId) {
@@ -2454,8 +3771,8 @@ v1.get('/chat/ws-token', authRequired, async (req, res) => {
   return res.json({
     token,
     roomId,
-    wsUrl: `${chatServiceUrl}/ws?token=${token}&roomId=${roomId}`,
-    longPollUrl: `${chatServiceUrl}/realtime/rooms/${roomId}/events?token=${token}`
+    wsUrl: `${chatPublicUrl}/ws?token=${token}&roomId=${roomId}`,
+    longPollUrl: `${chatPublicUrl}/realtime/rooms/${roomId}/events?token=${token}`
   });
 });
 
@@ -2484,8 +3801,18 @@ v1.post('/chat/rooms', authRequired, async (req, res) => {
   if (!participantUserId) {
     return res.status(400).json({ error: 'participantUserId is required' });
   }
-  if (participantUserId === req.auth.sub) {
-    return res.status(400).json({ error: 'participantUserId must be different from current user' });
+    if (participantUserId === req.auth.sub) {
+      return res.status(400).json({ error: 'participantUserId must be different from current user' });
+    }
+
+  const [meCreator, otherCreator] = await Promise.all([
+    userHasCreatorProfile(req.auth.sub),
+    userHasCreatorProfile(participantUserId)
+  ]);
+  if (!meCreator && !otherCreator) {
+    return res.status(400).json({
+      error: 'direct chat requires at least one participant to be a content creator'
+    });
   }
 
   const client = await pool.connect();
@@ -2502,6 +3829,12 @@ v1.post('/chat/rooms', authRequired, async (req, res) => {
     if (otherUser.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'participant user not found' });
+    }
+
+    const usersBlocked = await areUsersBlocked(req.auth.sub, participantUserId, client);
+    if (usersBlocked) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'participants cannot chat due to blocking' });
     }
 
     const existingRoom = await client.query(
@@ -2555,20 +3888,52 @@ v1.get('/chat/rooms/:id/messages', authRequired, async (req, res) => {
       return res.status(403).json({ error: 'not a participant of this room' });
     }
 
+    const otherUserId = await getOtherDirectRoomParticipant(roomId, req.auth.sub);
+    if (!otherUserId) {
+      return res.status(403).json({ error: 'direct room participant required' });
+    }
+    if (await areUsersBlocked(req.auth.sub, otherUserId)) {
+      return res.status(403).json({ error: 'messages unavailable due to blocking' });
+    }
+
+    if (chatHistoryDelegate) {
+      const qs = new URLSearchParams({ limit: String(limit) });
+      if (beforeValue) {
+        qs.set('before', beforeValue);
+      }
+      const pathAndQuery = `/internal/history/rooms/${encodeURIComponent(roomId)}/messages?${qs.toString()}`;
+      const { status, body } = await delegateChatHistory(req, 'GET', pathAndQuery);
+      return res.status(status).json(body);
+    }
+
     const result = await pool.query(
       `SELECT id, room_id, sender_user_id, body, attachments, status, sent_at, edited_at, deleted_at
        FROM message
        WHERE room_id = $1
          AND context = 'direct'
          AND ($2::timestamptz IS NULL OR sent_at < $2::timestamptz)
+         AND NOT EXISTS (
+           SELECT 1
+           FROM moderation_report mr
+           INNER JOIN moderation_action ma ON ma.report_id = mr.id
+           WHERE mr.target_type = 'message'
+             AND mr.target_id = message.id
+             AND ma.action_type IN ('hide_content', 'remove_content')
+             AND (ma.expires_at IS NULL OR ma.expires_at > now())
+         )
        ORDER BY sent_at DESC
        LIMIT $3`,
       [roomId, beforeValue, limit]
     );
 
-    return res.json({
-      messages: result.rows.reverse()
-    });
+    const messages = result.rows.reverse();
+    if (chatHistoryShadow) {
+      setImmediate(() => {
+        shadowChatHistoryCompare(roomId, req.auth.sub, limit, beforeValue, messages);
+      });
+    }
+
+    return res.json({ messages });
   } catch (error) {
     return res.status(500).json({ error: 'failed to fetch messages' });
   }
@@ -2587,6 +3952,20 @@ v1.post('/chat/rooms/:id/messages', authRequired, async (req, res) => {
   try {
     if (!(await isRoomParticipant(roomId, req.auth.sub))) {
       return res.status(403).json({ error: 'not a participant of this room' });
+    }
+
+    const otherUserId = await getOtherDirectRoomParticipant(roomId, req.auth.sub);
+    if (!otherUserId) {
+      return res.status(403).json({ error: 'direct room participant required' });
+    }
+    if (await areUsersBlocked(req.auth.sub, otherUserId)) {
+      return res.status(403).json({ error: 'cannot send messages due to blocking' });
+    }
+
+    if (chatHistoryDelegate) {
+      const pathAndQuery = `/internal/history/rooms/${encodeURIComponent(roomId)}/messages`;
+      const { status, body } = await delegateChatHistory(req, 'POST', pathAndQuery, { body });
+      return res.status(status).json(body);
     }
 
     const inserted = await pool.query(
@@ -2631,6 +4010,20 @@ v1.patch('/chat/rooms/:id/messages/:messageId', authRequired, async (req, res) =
       return res.status(403).json({ error: 'not a participant of this room' });
     }
 
+    const otherUserId = await getOtherDirectRoomParticipant(roomId, req.auth.sub);
+    if (!otherUserId) {
+      return res.status(403).json({ error: 'direct room participant required' });
+    }
+    if (await areUsersBlocked(req.auth.sub, otherUserId)) {
+      return res.status(403).json({ error: 'cannot edit messages due to blocking' });
+    }
+
+    if (chatHistoryDelegate) {
+      const pathAndQuery = `/internal/history/rooms/${encodeURIComponent(roomId)}/messages/${encodeURIComponent(messageId)}`;
+      const { status, body } = await delegateChatHistory(req, 'PATCH', pathAndQuery, { body });
+      return res.status(status).json(body);
+    }
+
     const updated = await pool.query(
       `UPDATE message
        SET body = $1, edited_at = now(), status = 'edited'
@@ -2668,6 +4061,20 @@ v1.delete('/chat/rooms/:id/messages/:messageId', authRequired, async (req, res) 
       return res.status(403).json({ error: 'not a participant of this room' });
     }
 
+    const otherUserId = await getOtherDirectRoomParticipant(roomId, req.auth.sub);
+    if (!otherUserId) {
+      return res.status(403).json({ error: 'direct room participant required' });
+    }
+    if (await areUsersBlocked(req.auth.sub, otherUserId)) {
+      return res.status(403).json({ error: 'cannot delete messages due to blocking' });
+    }
+
+    if (chatHistoryDelegate) {
+      const pathAndQuery = `/internal/history/rooms/${encodeURIComponent(roomId)}/messages/${encodeURIComponent(messageId)}`;
+      const { status, body } = await delegateChatHistory(req, 'DELETE', pathAndQuery);
+      return res.status(status).json(body);
+    }
+
     const deleted = await pool.query(
       `UPDATE message
        SET status = 'deleted', deleted_at = now(), body = NULL, attachments = '[]'::jsonb
@@ -2693,6 +4100,57 @@ v1.delete('/chat/rooms/:id/messages/:messageId', authRequired, async (req, res) 
     return res.json({ message });
   } catch (error) {
     return res.status(500).json({ error: 'failed to delete message' });
+  }
+});
+
+// Report chat messages for moderation
+v1.post('/chat/rooms/:id/messages/:messageId/report', authRequired, async (req, res) => {
+  const roomId = req.params.id;
+  const messageId = req.params.messageId;
+  const reasonCode = String(req.body?.reasonCode || '').trim();
+  const reasonText = req.body?.reasonText !== undefined ? String(req.body.reasonText).trim() : null;
+  const priority = req.body?.priority !== undefined ? Number(req.body.priority) : 3;
+
+  if (!reasonCode) {
+    return res.status(400).json({ error: 'reasonCode is required' });
+  }
+  if (!Number.isInteger(priority) || priority < 1 || priority > 5) {
+    return res.status(400).json({ error: 'priority must be an integer between 1 and 5' });
+  }
+  if (reasonText && reasonText.length > 2000) {
+    return res.status(400).json({ error: 'reasonText is too long' });
+  }
+
+  try {
+    if (!(await isRoomParticipant(roomId, req.auth.sub))) {
+      return res.status(403).json({ error: 'not a participant of this room' });
+    }
+
+    const messageExists = await pool.query(
+      `SELECT id
+       FROM message
+       WHERE id = $1
+         AND room_id = $2
+         AND context = 'direct'
+       LIMIT 1`,
+      [messageId, roomId]
+    );
+    if (messageExists.rows.length === 0) {
+      return res.status(404).json({ error: 'message not found' });
+    }
+
+    const inserted = await pool.query(
+      `INSERT INTO moderation_report (
+         reporter_user_id, target_type, target_id, reason_code, reason_text, priority
+       )
+       VALUES ($1, 'message', $2::uuid, $3, $4, $5)
+       RETURNING id, status, priority, created_at, reason_code, reason_text`,
+      [req.auth.sub, messageId, reasonCode, reasonText, priority]
+    );
+
+    return res.status(201).json({ report: inserted.rows[0] });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to create moderation report' });
   }
 });
 
@@ -3639,7 +5097,21 @@ v1.get('/streams/:id', async (req, res) => {
     if (!payload) {
       return res.status(404).json({ error: 'live session not found' });
     }
-    return res.json({ stream: payload.stream });
+    let stream = payload.stream;
+    if (liveAggregateDelegate) {
+      const agg = await fetchLiveAggregateFromGo(req.params.id);
+      if (agg) {
+        stream = {
+          ...payload.stream,
+          stats: {
+            ...payload.stream.stats,
+            wsViewerConnections: Number(agg.wsViewerConnections ?? 0),
+            aggregateSource: agg.source || 'go_aggregate'
+          }
+        };
+      }
+    }
+    return res.json({ stream });
   } catch (error) {
     return res.status(500).json({ error: 'failed to fetch live session' });
   }

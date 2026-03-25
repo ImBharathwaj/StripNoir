@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stripnoir-api
+  namespace: stripnoir
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: stripnoir-api
+  template:
+    metadata:
+      labels:
+        app: stripnoir-api
+    spec:
+      containers:
+        - name: api
+          image: stripnoir/api:latest
+          ports:
+            - containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            # Replace with Secret/ConfigMap refs in production
+            - name: DATABASE_URL
+              value: postgresql://app:app@pgbouncer:6432/stripnoir
+            - name: REDIS_URL
+              value: redis://redis:6379
+            - name: CHAT_SERVICE_URL
+              value: http://stripnoir-chat:8080
+            - name: CHAT_PUBLIC_URL
+              value: https://api.example.com
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stripnoir-api
+  namespace: stripnoir
+spec:
+  selector:
+    app: stripnoir-api
+  ports:
+    - port: 3000
+      targetPort: 3000

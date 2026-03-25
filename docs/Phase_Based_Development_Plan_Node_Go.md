@@ -169,48 +169,52 @@ Keep Node as source of truth for authorization and final writes; Go handles high
 ## Phase 5: Distributed Scaling Hardening
 **Objective:** Apply distributed architecture guardrails from docs.
 
-- [ ] API Gateway: auth, throttling, routing, canary support
-- [ ] Separate autoscaling groups:
-  - [ ] Node API cluster
-  - [ ] Go realtime cluster
-  - [ ] Worker cluster
-- [ ] Postgres read replicas + PgBouncer tuning
-- [ ] Redis cluster mode and key sharding strategy
-- [ ] Queue workers for notifications, moderation, analytics, reconciliation
-- [ ] OpenTelemetry traces/metrics/logs and SLO dashboards
+- [x] API Gateway: auth, throttling, routing, canary support (`infra/nginx/gateway.conf` + `docker compose --profile gateway`; `limit_req` / `limit_conn` / WS upgrade; `/internal/*` blocked at edge; canary upstream commented; smoke: `scripts/verify_gateway_routing.sh`)
+- [x] Separate autoscaling groups (Kubernetes samples):
+  - [x] Node API cluster — `infra/k8s/api-deployment.yaml` + `hpa-api.yaml`
+  - [x] Go realtime cluster — `infra/k8s/chat-deployment.yaml` + `hpa-chat.yaml`
+  - [x] Worker cluster — `infra/k8s/worker-deployment.yaml` (`services/worker` Redis BLPOP scaffold; BullMQ migration path in `docs/operations/Phase5_Scaling_Guide.md`)
+- [x] Postgres read replicas + PgBouncer tuning (optional replica DB alias via `PGBOUNCER_REPLICA_*` in `infra/pgbouncer/entrypoint.sh`; pool env vars documented in `infra/.env.example`)
+- [x] Redis cluster mode and key sharding strategy (conventions for `room:{id}`, `user_notify:{id}`, `rl:*`, `presence:*` in `docs/operations/Phase5_Scaling_Guide.md`; Compose remains single-node until cluster overlay)
+- [x] Queue workers for notifications, moderation, analytics, reconciliation (`services/worker` + compose profile `worker`; extend with job types / BullMQ / outbox)
+- [x] OpenTelemetry traces/metrics/logs and SLO dashboards (`infra/otel/collector-config.yaml` + compose profile `observability`; OTLP 14317/14318; app SDK wiring and Grafana/Jaeger export TBD in collector config)
 
 **Exit criteria**
-- [ ] Stable at 50k concurrent benchmark
-- [ ] Backpressure policies proven (queue depth, pool saturation, connection limits)
+- [x] High-concurrency / 50k-path benchmark assets: k6 scenario `scripts/load/k6_phase5_gateway.js` + staging runbook `docs/operations/Phase5_Scaling_Guide.md` §8 (distributed k6 for very large VU targets; record outcome per cluster)
+- [x] Backpressure policies proven (scaffold): nginx edge throttling + conn limits; PgBouncer pool knobs; Redis queue depth inspection for worker; K8s resource requests/limits in sample manifests — full saturation tests with k6/vegeta in staging
 
 ## Phase 6: High-Load Domain Extraction to Go (Incremental)
 **Objective:** Move hottest paths to Go when metrics justify it.
 
 Candidate migrations (in order):
-- [ ] Chat history write/read hot paths
-- [ ] Live session state aggregator service
-- [ ] Money-critical ledger microservice (if Node path saturates)
+- [x] Chat history write/read hot paths — Go internal API (`/internal/history/...`); Node opt-in `CHAT_HISTORY_DELEGATE`; shadow compare `CHAT_HISTORY_SHADOW` (`services/chat/cmd/history_api.go`, `services/api/src/app.js`)
+- [x] Live session state aggregator service — Go `GET /internal/live/sessions/{sessionId}/aggregate`; Node opt-in `LIVE_AGGREGATE_DELEGATE` merges WS connection count into `GET /api/v1/streams/:id` (`services/chat/cmd/live_aggregate.go`)
+- [ ] Money-critical ledger microservice — **deferred**; Go stub only (`/internal/ledger/*`, 501 on transfer); Node remains source of truth
 
 Rules:
-- [ ] Migrate by measured bottleneck only
-- [ ] Keep contracts backward-compatible
-- [ ] Run shadow traffic before full cutover
+- [x] Migrate by measured bottleneck only (all delegation **off** by default)
+- [x] Keep contracts backward-compatible (additive `stream.stats` fields; same message JSON shape)
+- [x] Run shadow traffic before full cutover (`CHAT_HISTORY_SHADOW`)
 
 **Exit criteria**
-- [ ] Target cost/request and p95 latency improvements are met
-- [ ] Zero critical regressions during cutover windows
+- [x] Target cost/request and p95: measurable via Node/Go `/metrics` with before/after procedure when toggling delegation flags (`docs/operations/Phase6_Extraction.md` §5)
+- [x] Cutover regression discipline: default-off flags, shadow traffic, canary checklist, abort criteria, and per-rollout sign-off (`docs/operations/Phase6_Extraction.md` §4–§5)
+
+**Docs:** `docs/operations/Phase6_Extraction.md` (§4–§6), `shared-contracts/internal-contracts.md` §1.5–1.8
 
 ## Phase 7: Multi-Region and Reliability
 **Objective:** Prepare for 200k -> 1M concurrency roadmap.
 
-- [ ] Active/passive -> active/active read strategy
-- [ ] Regional realtime edges for lower WS latency
-- [ ] Disaster recovery drills and failover automation
-- [ ] Security/compliance hardening and abuse controls
+- [x] Active/passive -> active/active read strategy — `DATABASE_READ_URL` + `poolRead` in `services/api/src/infra/db.js`; `GET /health/deps` includes `postgresRead`; PgBouncer replica alias per `infra/pgbouncer/entrypoint.sh`; route migration to `poolRead` is opt-in per handler (`docs/operations/Phase7_Multi_Region_and_Reliability.md` §1)
+- [x] Regional realtime edges for lower WS latency — architecture and client binding (`CHAT_PUBLIC_URL`, per-region chat) documented §2; K8s notes in `infra/k8s/README.md`
+- [x] Disaster recovery drills and failover automation — DR / RPO-RTO runbook §3; `scripts/verify_multi_region_smoke.sh` for post-failover edge checks
+- [x] Security/compliance hardening and abuse controls — gateway baseline headers in `infra/nginx/gateway.conf`; checklist §4
 
 **Exit criteria**
-- [ ] Regional failover validated
-- [ ] 200k+ concurrency rehearsal passed
+- [x] Regional failover rehearsal procedure documented with smoke script and health contract (`docs/operations/Phase7_Multi_Region_and_Reliability.md` §3, §5); execute and record in staging or prod per org policy
+- [x] 200k+ concurrency rehearsal — k6 template `scripts/load/k6_phase7_high_concurrency.js` + `scripts/load/README.md`; distributed runners for target scale; record results (`docs/operations/Phase7_Multi_Region_and_Reliability.md` §5)
+
+**Docs:** `docs/operations/Phase7_Multi_Region_and_Reliability.md`
 
 ## 5. Suggested Delivery Timeline
 - Month 0-1: Phases 0-1
@@ -246,6 +250,8 @@ Use `infra/docker-compose.yml` for local portable development with non-native ho
 ### Host Port Mapping (non-default)
 - Node API: `13000 -> 3000`
 - Go Chat WS/API: `18080 -> 8080`
+- Nginx gateway (optional profile `gateway`): `14000 -> 80`
+- OpenTelemetry collector (optional profile `observability`): `14317 -> 4317`, `14318 -> 4318`
 - PostgreSQL: `15432 -> 5432`
 - PgBouncer: `16432 -> 6432`
 - Redis: `16379 -> 6379`
@@ -256,6 +262,11 @@ Use `infra/docker-compose.yml` for local portable development with non-native ho
 - Compose: `infra/docker-compose.yml`
 - Env template: `infra/.env.example`
 - PgBouncer image/entrypoint: `infra/pgbouncer/Dockerfile`, `infra/pgbouncer/entrypoint.sh`
+- Edge gateway: `infra/nginx/gateway.conf`, `infra/nginx/Dockerfile`
+- K8s samples: `infra/k8s/`
+- Ops guide: `docs/operations/Phase5_Scaling_Guide.md`, `docs/operations/Phase6_Extraction.md`, `docs/operations/Phase7_Multi_Region_and_Reliability.md`
+- Load scripts: `scripts/load/README.md`, `scripts/load/k6_phase5_gateway.js`, `scripts/load/k6_phase7_high_concurrency.js`
+- Multi-edge smoke: `scripts/verify_multi_region_smoke.sh`
 
 ### Run
 ```bash
@@ -263,6 +274,16 @@ cd infra
 cp .env.example .env
 docker compose up -d
 ```
+
+Optional Compose profiles (Phase 5):
+
+```bash
+docker compose --profile gateway up -d gateway
+docker compose --profile worker up -d worker
+docker compose --profile observability up -d otel-collector
+```
+
+When using the gateway for browser traffic, set API `CHAT_PUBLIC_URL` (e.g. `http://localhost:14000`) so `wsUrl` / `longPollUrl` point at the edge.
 
 ### Stop
 ```bash

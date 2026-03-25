@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stripnoir-chat
+  namespace: stripnoir
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: stripnoir-chat
+  template:
+    metadata:
+      labels:
+        app: stripnoir-chat
+    spec:
+      containers:
+        - name: chat
+          image: stripnoir/chat:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: REDIS_URL
+              value: redis://redis:6379
+            - name: DATABASE_URL
+              value: postgresql://app:app@pgbouncer:6432/stripnoir
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "2"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stripnoir-chat
+  namespace: stripnoir
+spec:
+  selector:
+    app: stripnoir-chat
+  ports:
+    - port: 8080
+      targetPort: 8080

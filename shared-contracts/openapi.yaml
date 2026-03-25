@@ -216,7 +216,10 @@ paths:
   /api/v1/creators/subscription:
     post:
       tags: [Creator]
-      summary: Subscribe current user to creator
+      summary: Subscribe current user to creator (no payment)
+      description: |
+        **Disabled by default** in production-like configs: returns **403** unless `ALLOW_FREE_SUBSCRIPTION=1`.
+        For paid subscriptions use **`POST /api/v1/payments/subscribe`** (credits transfer + subscription row).
       security:
         - bearerAuth: []
       requestBody:
@@ -234,6 +237,103 @@ paths:
         '201':
           description: Subscription active
 
+  /api/v1/creators/verification/submit:
+    post:
+      tags: [Creator]
+      summary: Submit creator verification documents
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mediaAssetIds]
+              properties:
+                mediaAssetIds:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                metadata:
+                  type: object
+      responses:
+        '201':
+          description: Verification submission created
+        '403':
+          description: Creator profile required
+
+  /api/v1/creators/verification/status:
+    get:
+      tags: [Creator]
+      summary: Get current creator verification status
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Verification status payload
+
+  /api/v1/admin/creator-verifications:
+    get:
+      tags: [Creator]
+      summary: List creator verification submissions (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, approved, rejected]
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Verification submissions list
+
+  /api/v1/admin/creator-verifications/{submissionId}/approve:
+    post:
+      tags: [Creator]
+      summary: Approve creator verification submission (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: submissionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Approved
+
+  /api/v1/admin/creator-verifications/{submissionId}/reject:
+    post:
+      tags: [Creator]
+      summary: Reject creator verification submission (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: submissionId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Rejected
+
   /api/v1/content:
     post:
       tags: [Content]
@@ -248,6 +348,9 @@ paths:
     get:
       tags: [Content]
       summary: Get content details
+      description: |
+        Access rules include `public`, `followers`, `subscribers`, `private` (subscriber-only),
+        and `exclusive_ppv` (subscription and/or PPV unlock via `POST .../unlock` when `requiresPayment`).
       security:
         - bearerAuth: []
       parameters:
@@ -255,6 +358,33 @@ paths:
       responses:
         '200':
           description: Content payload
+    patch:
+      tags: [Content]
+      summary: Update owned content post
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ContentId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string, nullable: true }
+                caption: { type: string, nullable: true }
+                visibility:
+                  type: string
+                  enum: [public, followers, subscribers, exclusive_ppv, private]
+                status:
+                  type: string
+                  enum: [draft, published, archived, deleted]
+                requiresPayment: { type: boolean }
+                unlockPriceCredits: { type: integer, minimum: 0 }
+                metadata: { type: object }
+      responses:
+        '200':
+          description: Updated content
     delete:
       tags: [Content]
       summary: Delete owned content
@@ -265,6 +395,22 @@ paths:
       responses:
         '200':
           description: Delete status
+
+  /api/v1/content/{id}/unlock:
+    post:
+      tags: [Content]
+      summary: Pay credits to unlock PPV content (exclusive_ppv + requiresPayment)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ContentId'
+      responses:
+        '201':
+          description: Unlocked; ledger transfer returned
+        '200':
+          description: Already had access
+        '402':
+          description: Insufficient credits
 
   /api/v1/feed:
     get:
@@ -285,6 +431,82 @@ paths:
       responses:
         '200':
           description: Feed entries
+
+  /api/v1/feed/creators:
+    get:
+      tags: [Feed]
+      summary: Home / discovery list of content creators
+      description: |
+        Paginated list of creators (excluding the current user) with **subscription list price** (`stats.subscriptionPriceCredits`,
+        same source as `creator.defaultSubscriptionPriceCredits`) and **active subscriber count** (`stats.activeSubscribers`).
+        Includes whether the viewer already follows or is subscribed. Order: most subscribers first, then recently updated.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: search
+          in: query
+          description: Case-insensitive substring match against `username`, `display_name`, `stage_name`, and `about`.
+          schema:
+            type: string
+        - name: category
+          in: query
+          description: Case-insensitive match against `creator_profile.category_tags`.
+          schema:
+            type: string
+        - name: verification_status
+          in: query
+          description: Filter by `creator_profile.verification_status`.
+          schema:
+            type: string
+            enum: [pending, approved, rejected]
+      responses:
+        '200':
+          description: Creator cards for home or browse UI
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [creators]
+                properties:
+                  creators:
+                    type: array
+                    items:
+                      type: object
+                      required: [creator, stats, viewer]
+                      properties:
+                        creator:
+                          type: object
+                          description: Creator profile plus public user display fields
+                        stats:
+                          type: object
+                          required: [activeSubscribers, subscriptionPriceCredits]
+                          properties:
+                            activeSubscribers:
+                              type: integer
+                              description: Count of users with an active subscription to this creator
+                            subscriptionPriceCredits:
+                              type: integer
+                              description: Default subscription price in credits (period charged via payments/subscribe)
+                        viewer:
+                          type: object
+                          properties:
+                            isFollowing:
+                              type: boolean
+                            isSubscribed:
+                              type: boolean
 
   /api/v1/payments/deposit:
     post:
@@ -549,6 +771,161 @@ paths:
       responses:
         '201':
           description: Room created
+
+  /api/v1/users/{id}/block:
+    post:
+      tags: [Chat]
+      summary: Block another user (prevents direct-chat messages)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+      responses:
+        '201':
+          description: Block created
+    delete:
+      tags: [Chat]
+      summary: Unblock a previously blocked user
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      responses:
+        '200':
+          description: Unblocked status
+
+  /api/v1/chat/rooms/{roomId}/messages/{messageId}/report:
+    post:
+      tags: [Chat]
+      summary: Report a direct message for moderation
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: roomId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: messageId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reasonCode]
+              properties:
+                reasonCode:
+                  type: string
+                  minLength: 1
+                reasonText:
+                  type: string
+                  nullable: true
+                priority:
+                  type: integer
+                  minimum: 1
+                  maximum: 5
+                  default: 3
+      responses:
+        '201':
+          description: Moderation report created
+
+  /api/v1/admin/moderation/reports:
+    get:
+      tags: [Admin, Moderation]
+      summary: List moderation reports
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [open, in_review, resolved, dismissed]
+          required: false
+        - name: targetType
+          in: query
+          schema:
+            type: string
+            enum: [user, content, message, live_session, video_call_session]
+          required: false
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: offset
+          in: query
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Reports list
+
+  /api/v1/admin/moderation/reports/{reportId}/action:
+    post:
+      tags: [Admin, Moderation]
+      summary: Apply moderation action to a report
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: reportId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [actionType]
+              properties:
+                actionType:
+                  type: string
+                  enum: [hide_content, remove_content]
+                reason:
+                  type: string
+                  nullable: true
+                expiresInSeconds:
+                  type: integer
+                  minimum: 1
+      responses:
+        '200':
+          description: Action applied and report resolved
+
+  /api/v1/admin/moderation/reports/{reportId}/dismiss:
+    post:
+      tags: [Admin, Moderation]
+      summary: Dismiss a moderation report
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: reportId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Report dismissed
 
 components:
   securitySchemes:

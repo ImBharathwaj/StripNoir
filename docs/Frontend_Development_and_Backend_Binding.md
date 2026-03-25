@@ -20,7 +20,7 @@ This document describes how a web (or mobile-web) client should be structured, h
 - Node API: `http://localhost:13000` (container port `3000`)
 - Go chat: `http://localhost:18080` (container port `8080`)
 
-**Browser rule:** the app must use **public hostnames** (or dev proxies), not Docker service names (`http://chat:8080`). The Node API already returns absolute `wsUrl` / `longPollUrl` built from `CHAT_SERVICE_URL` as seen **from the API**; for local dev, ensure that URL is reachable from the **browser** (e.g. `http://localhost:18080`). In production, front an API gateway that exposes both API and chat under consistent TLS hosts, or return chat URLs that point to a public `wss://` host.
+**Browser rule:** the app must use **public hostnames** (or dev proxies), not Docker service names (`http://chat:8080`). The Node API returns `wsUrl` / `longPollUrl` using **`CHAT_PUBLIC_URL`** when set, otherwise **`CHAT_SERVICE_URL`**. Use `CHAT_PUBLIC_URL` behind the nginx gateway (e.g. `http://localhost:14000`) while keeping `CHAT_SERVICE_URL=http://chat:8080` for server-side internal publish calls. For local dev without a gateway, `http://localhost:18080` is typical. In production, use TLS `wss://` on the public edge.
 
 ## 3. Configuration surface (frontend env)
 
@@ -29,7 +29,7 @@ Recommended variables (names are illustrative; adjust to your framework):
 | Variable | Purpose |
 |----------|---------|
 | `PUBLIC_API_BASE_URL` | Origin for Node only, e.g. `https://api.example.com` (no trailing slash) |
-| `PUBLIC_CHAT_HTTP_ORIGIN` | Optional override if `wsUrl` from API is wrong for browsers; prefer fixing server-side `CHAT_SERVICE_URL` |
+| `PUBLIC_CHAT_HTTP_ORIGIN` | Rarely needed; prefer server `CHAT_PUBLIC_URL` / gateway alignment so `wsUrl` from the API is correct |
 | `PUBLIC_LIVEKIT_URL` | From stream/call API responses when present; used by LiveKit client SDK |
 
 All authenticated REST calls: `Authorization: Bearer <access_token>`.
@@ -139,7 +139,7 @@ Keep **one** realtime manager per scope (e.g. one WS per active room, one notify
 | Phase | Scope | Backend touchpoints |
 |-------|--------|---------------------|
 | F0 | Scaffold app, env, API client, auth pages, `auth/me` | Node `/auth/*`, `/auth/me` |
-| F1 | Profiles, feed, content list/detail, basic navigation | Node users/creators/content/feed |
+| F1 | Profiles, feeds, content list/detail, basic navigation | Node `users`/`creators`/`content`; **`GET /api/v1/feed/creators`** for home/browse creator cards (price + subscriber count); post feeds `feed`, `feed/following`, `feed/trending` |
 | F2 | Wallet display, deposit, tips, subscribe | Node payments, wallet |
 | F3 | DM chat: room list, messages REST + **chat WS** | Node `/chat/*`, Go `ws` from `chat/ws-token` |
 | F4 | Notification inbox + **notify WS** | Node `/notifications*`, Go notify stream |
