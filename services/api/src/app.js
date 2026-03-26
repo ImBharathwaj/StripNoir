@@ -4,6 +4,8 @@ const morgan = require('morgan');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const http = require('http');
+const https = require('https');
 const { checkPostgres, checkPostgresRead, closePostgres } = require('./infra/db');
 const { checkRedis, closeRedis, redisClient, ensureRedisConnected } = require('./infra/redis');
 const { pool } = require('./infra/db');
@@ -54,7 +56,11 @@ const livekitApiSecret = process.env.LIVEKIT_API_SECRET || '';
 const livekitTokenTtlSeconds = Math.max(Number(process.env.LIVEKIT_TOKEN_TTL_SECONDS || 3600), 60);
 
 // MinIO/S3 presigned uploads (S3 SigV4). We avoid extra SDK deps to keep installs simple.
+// MINIO_ENDPOINT: where the API process reaches MinIO (e.g. http://minio:9000 in Docker). Used for
+// server-side proxying (public-stream); must not be localhost inside a container unless MinIO is there.
+// MINIO_PUBLIC_URL: host embedded in presigned URLs sent to browsers / 302 redirects — reachable from users.
 const minioEndpoint = process.env.MINIO_ENDPOINT || 'http://localhost:19000';
+const minioPresignBaseUrl = process.env.MINIO_PUBLIC_URL || process.env.MINIO_PRESIGN_BASE_URL || minioEndpoint;
 const minioBucket = process.env.MINIO_BUCKET || 'stripnoir';
 const minioRegion = process.env.MINIO_REGION || 'us-east-1';
 const minioAccessKey = process.env.MINIO_ROOT_USER || '';
@@ -100,7 +106,7 @@ function createMinioPresignedPutUrl({ objectKey, contentType, expiresSeconds }) 
   if (!minioAccessKey || !minioSecretKey) {
     throw new Error('MINIO_ROOT_USER/MINIO_ROOT_PASSWORD not configured');
   }
-  const endpointUrl = new URL(minioEndpoint);
+  const endpointUrl = new URL(minioPresignBaseUrl);
   const protocol = endpointUrl.protocol.replace(/:$/, '');
   const host = endpointUrl.host; // includes :port when present
 
@@ -144,6 +150,57 @@ function createMinioPresignedPutUrl({ objectKey, contentType, expiresSeconds }) 
     credentialScope,
     sha256Hex(canonicalRequest)
   ].join('\n');
+
+  const signingKey = getSignatureKey(minioSecretKey, dateStamp, region, service);
+  const signature = hmacSha256(signingKey, stringToSign).toString('hex');
+
+  const finalQueryString = `${canonicalQueryString}&X-Amz-Signature=${rfc3986Encode(signature)}`;
+  const objectPath = `/${rfc3986Encode(minioBucket)}/${encodeObjectKey(objectKey)}`;
+  return `${protocol}://${host}${objectPath}?${finalQueryString}`;
+}
+
+/**
+ * @param {{ objectKey: string, expiresSeconds: number, forServerFetch?: boolean }} opts
+ * When forServerFetch is true, signs against MINIO_ENDPOINT so the API can open the URL from Docker
+ * (presigned URLs built with MINIO_PUBLIC_URL often use localhost, which is wrong inside a container).
+ */
+function createMinioPresignedGetUrl({ objectKey, expiresSeconds, forServerFetch = false }) {
+  if (!minioAccessKey || !minioSecretKey) {
+    throw new Error('MINIO_ROOT_USER/MINIO_ROOT_PASSWORD not configured');
+  }
+  const baseForSigning = forServerFetch ? minioEndpoint : minioPresignBaseUrl;
+  const endpointUrl = new URL(baseForSigning);
+  const protocol = endpointUrl.protocol.replace(/:$/, '');
+  const host = endpointUrl.host;
+
+  const method = 'GET';
+  const service = 's3';
+  const region = minioRegion;
+  const { amzDate, dateStamp } = getAmsDateParts();
+
+  const credentialScope = `${dateStamp}/${region}/${service}/aws4_request`;
+  const canonicalUri = `/${rfc3986Encode(minioBucket)}/${encodeObjectKey(objectKey)}`;
+
+  const query = {
+    'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
+    'X-Amz-Credential': `${minioAccessKey}/${credentialScope}`,
+    'X-Amz-Date': amzDate,
+    'X-Amz-Expires': String(expiresSeconds),
+    'X-Amz-SignedHeaders': 'host'
+  };
+
+  const canonicalQueryString = Object.keys(query)
+    .sort()
+    .map((k) => `${rfc3986Encode(k)}=${rfc3986Encode(query[k])}`)
+    .join('&');
+
+  const canonicalHeaders = `host:${host}\n`;
+  const signedHeaders = 'host';
+  const payloadHash = 'UNSIGNED-PAYLOAD';
+
+  const canonicalRequest = [method, canonicalUri, canonicalQueryString, canonicalHeaders, signedHeaders, payloadHash].join('\n');
+
+  const stringToSign = ['AWS4-HMAC-SHA256', amzDate, credentialScope, sha256Hex(canonicalRequest)].join('\n');
 
   const signingKey = getSignatureKey(minioSecretKey, dateStamp, region, service);
   const signature = hmacSha256(signingKey, stringToSign).toString('hex');
@@ -240,6 +297,42 @@ const apiAuthLimiter = createRedisFixedWindowLimiter({
 v1.use(apiGeneralLimiter);
 v1.use(pollFallbackHintMiddleware);
 
+/** Same as public-read route; keys are uploads|content|subscription-content / userId / objectId (UUIDs with hyphens). */
+const PUBLIC_MEDIA_KEY_RE = /^(uploads|content|subscription-content)\/[\da-f-]{36}\/[\da-f-]{36}$/i;
+
+function rewriteStoredMediaUrlToPublicRead(stored) {
+  if (stored == null || stored === '') return stored;
+  if (typeof stored !== 'string') return stored;
+  const t = stored.trim();
+  if (!t) return stored;
+  if (t.startsWith('/api/v1/media/public-read')) return t;
+  try {
+    const publicBase = new URL(minioPresignBaseUrl);
+    const u = new URL(t);
+    const pathOk = /^\/[^/]+\/(uploads|content|subscription-content)\/[\da-f-]{36}\/[\da-f-]{36}\/?$/i.test(
+      u.pathname
+    );
+    if (u.host !== publicBase.host && !pathOk) return stored;
+    const segs = u.pathname.replace(/^\/+/, '').split('/').filter(Boolean);
+    if (segs.length < 3) return stored;
+    const [bkt, ...rest] = segs;
+    const key = rest.join('/');
+    if (bkt !== minioBucket || !PUBLIC_MEDIA_KEY_RE.test(key)) return stored;
+    return `/api/v1/media/public-read?${new URLSearchParams({ bucket: bkt, key }).toString()}`;
+  } catch {
+    return stored;
+  }
+}
+
+/** Fan-visible blurb: creator_profile.about, else user_account.bio (many creators only edit /me bio). */
+function mergeCreatorPublicAbout(row) {
+  const a = row.about != null ? String(row.about).trim() : '';
+  const b = row.bio != null ? String(row.bio).trim() : '';
+  if (a) return a;
+  if (b) return b;
+  return null;
+}
+
 function hashToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
 }
@@ -250,6 +343,8 @@ function sanitizeUser(row) {
     email: row.email,
     username: row.username,
     displayName: row.display_name,
+    avatarUrl: row.avatar_url != null ? rewriteStoredMediaUrlToPublicRead(row.avatar_url) : null,
+    bio: row.bio != null ? row.bio : null,
     status: row.status,
     createdAt: row.created_at
   };
@@ -337,7 +432,7 @@ function sanitizeLiveSession(row) {
     livekitRoomName: row.livekit_room_name,
     title: row.title,
     description: row.description,
-    streamThumbnailUrl: row.stream_thumbnail_url,
+    streamThumbnailUrl: rewriteStoredMediaUrlToPublicRead(row.stream_thumbnail_url),
     status: row.status,
     scheduledStartAt: row.scheduled_start_at,
     startedAt: row.started_at,
@@ -354,7 +449,8 @@ function sanitizeLiveSession(row) {
       userId: row.creator_user_id,
       stageName: row.stage_name,
       username: row.username,
-      displayName: row.display_name
+      displayName: row.display_name,
+      avatarUrl: rewriteStoredMediaUrlToPublicRead(row.avatar_url)
     },
     stats: {
       activeViewers: Number(row.active_viewer_count || 0)
@@ -868,6 +964,7 @@ async function getLiveSessionById(sessionId, viewerUserId = null, db = pool) {
             cp.stage_name,
             ua.username,
             ua.display_name,
+            ua.avatar_url,
             COALESCE(viewers.active_viewer_count, 0)::int AS active_viewer_count,
             v.id AS viewer_record_id,
             v.joined_at AS viewer_joined_at,
@@ -1113,6 +1210,101 @@ v1.post('/auth/register', ...(apiAuthLimiterFlag ? [apiAuthLimiter] : []), async
   }
 });
 
+/**
+ * Atomically create user_account + fan role + creator role + creator_profile + wallet, then return
+ * session tokens (same shape as login). Use this instead of register + creators/apply so the client
+ * is authenticated and the creator row exists in one step.
+ */
+v1.post('/auth/register/creator', ...(apiAuthLimiterFlag ? [apiAuthLimiter] : []), async (req, res) => {
+  const { email, password, displayName, username } = req.body || {};
+  const stageName = String(req.body?.stageName || '').trim();
+  const about = req.body?.about ? String(req.body.about).trim() : null;
+  const categoryTags = Array.isArray(req.body?.categoryTags)
+    ? req.body.categoryTags.map((tag) => String(tag).trim()).filter(Boolean)
+    : [];
+  const isNsfw = req.body?.isNsfw !== undefined ? Boolean(req.body.isNsfw) : true;
+  const defaultSubscriptionPriceCredits = Math.max(Number(req.body?.defaultSubscriptionPriceCredits || 0), 0);
+
+  if (!email || !password || !displayName) {
+    return res.status(400).json({ error: 'email, password and displayName are required' });
+  }
+  if (!stageName) {
+    return res.status(400).json({ error: 'stageName is required' });
+  }
+  if (String(password).length < 8) {
+    return res.status(400).json({ error: 'password must be at least 8 characters' });
+  }
+
+  const passwordHash = await bcrypt.hash(password, 12);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const created = await client.query(
+      `INSERT INTO user_account (email, password_hash, display_name, username)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, email, username, display_name, avatar_url, bio, status, created_at`,
+      [email.trim().toLowerCase(), passwordHash, displayName.trim(), username || null]
+    );
+    const user = created.rows[0];
+
+    await client.query(
+      `INSERT INTO user_role (user_id, role)
+       VALUES ($1, 'user')
+       ON CONFLICT (user_id, role) DO NOTHING`,
+      [user.id]
+    );
+    await client.query(
+      `INSERT INTO user_role (user_id, role)
+       VALUES ($1, 'creator')
+       ON CONFLICT (user_id, role) DO NOTHING`,
+      [user.id]
+    );
+
+    await client.query(
+      `INSERT INTO wallet_account (user_id)
+       VALUES ($1)
+       ON CONFLICT (user_id) DO NOTHING`,
+      [user.id]
+    );
+
+    const profile = await client.query(
+      `INSERT INTO creator_profile (
+         user_id, stage_name, about, category_tags, is_nsfw, verification_status, default_subscription_price_credits
+       )
+       VALUES ($1, $2, $3, $4::text[], $5, 'pending', $6)
+       RETURNING *`,
+      [user.id, stageName, about, categoryTags, isNsfw, defaultSubscriptionPriceCredits]
+    );
+
+    await client.query('COMMIT');
+
+    const session = await issueSessionTokens({
+      userId: user.id,
+      email: user.email,
+      role: 'creator',
+      userAgent: req.headers['user-agent'],
+      ipAddress: getClientIp(req)
+    });
+
+    return res.status(201).json({
+      token: session.accessToken,
+      refreshToken: session.refreshToken,
+      sessionId: session.sessionId,
+      user: sanitizeUser(user),
+      creatorProfile: sanitizeCreator(profile.rows[0])
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    if (error && error.code === '23505') {
+      return res.status(409).json({ error: 'email or username already exists' });
+    }
+    return res.status(500).json({ error: 'failed to create creator account' });
+  } finally {
+    client.release();
+  }
+});
+
 v1.post('/auth/login', ...(apiAuthLimiterFlag ? [apiAuthLimiter] : []), async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) {
@@ -1326,16 +1518,31 @@ v1.post('/auth/logout', async (req, res) => {
 v1.get('/auth/me', authRequired, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, email, username, display_name, status, created_at
-       FROM user_account
-       WHERE id = $1
+      `SELECT ua.id, ua.email, ua.username, ua.display_name, ua.avatar_url, ua.bio, ua.status, ua.created_at,
+              COALESCE((SELECT ur.role::text
+                        FROM user_role ur
+                        WHERE ur.user_id = ua.id
+                        ORDER BY CASE ur.role
+                          WHEN 'admin' THEN 1
+                          WHEN 'moderator' THEN 2
+                          WHEN 'creator' THEN 3
+                          ELSE 4 END
+                        LIMIT 1), 'user') AS role
+       FROM user_account ua
+       WHERE ua.id = $1
        LIMIT 1`,
       [req.auth.sub]
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'user not found' });
     }
-    return res.json({ user: sanitizeUser(result.rows[0]) });
+    const row = result.rows[0];
+    const cp = await pool.query(`SELECT * FROM creator_profile WHERE user_id = $1 LIMIT 1`, [req.auth.sub]);
+    const creatorProfile = cp.rows.length > 0 ? sanitizeCreator(cp.rows[0]) : null;
+    return res.json({
+      user: { ...sanitizeUser(row), role: row.role },
+      creatorProfile
+    });
   } catch (error) {
     return res.status(500).json({ error: 'failed to fetch current user' });
   }
@@ -1376,7 +1583,7 @@ v1.get('/users/:id', authRequired, async (req, res) => {
         email: row.email,
         username: row.username,
         displayName: row.display_name,
-        avatarUrl: row.avatar_url,
+        avatarUrl: rewriteStoredMediaUrlToPublicRead(row.avatar_url),
         bio: row.bio,
         status: row.status,
         createdAt: row.created_at
@@ -1425,7 +1632,7 @@ v1.put('/users/me', authRequired, async (req, res) => {
         email: row.email,
         username: row.username,
         displayName: row.display_name,
-        avatarUrl: row.avatar_url,
+        avatarUrl: rewriteStoredMediaUrlToPublicRead(row.avatar_url),
         bio: row.bio,
         status: row.status,
         createdAt: row.created_at
@@ -1652,8 +1859,9 @@ v1.get('/creators/:id', authRequired, async (req, res) => {
         ...sanitizeCreator(creator),
         username: creator.username,
         displayName: creator.display_name,
-        avatarUrl: creator.avatar_url,
-        bio: creator.bio
+        avatarUrl: rewriteStoredMediaUrlToPublicRead(creator.avatar_url),
+        bio: creator.bio,
+        about: mergeCreatorPublicAbout(creator)
       },
       stats: {
         followers: followerCount.rows[0].count,
@@ -1927,6 +2135,127 @@ v1.delete('/creators/:id/subscription', authRequired, async (req, res) => {
   } catch (error) {
     return res.status(500).json({ error: 'failed to cancel subscription' });
   }
+});
+
+/** Unauthenticated: redirect to short-lived presigned MinIO GET (works without public bucket policy). */
+v1.get('/media/public-read', (req, res) => {
+  const bucket = String(req.query.bucket || '').trim();
+  const key = String(req.query.key || '').trim();
+  if (!bucket || !key || bucket !== minioBucket || !PUBLIC_MEDIA_KEY_RE.test(key)) {
+    return res.status(400).json({ error: 'invalid media reference' });
+  }
+
+  // Proxy bytes instead of redirecting to the presigned MinIO URL.
+  // This prevents the browser from receiving a direct downloadable MinIO link.
+  let presigned;
+  try {
+    presigned = createMinioPresignedGetUrl({ objectKey: key, expiresSeconds: 3600, forServerFetch: true });
+  } catch (e) {
+    return res.status(500).json({ error: 'failed to sign download' });
+  }
+
+  const target = new URL(presigned);
+  const lib = target.protocol === 'https:' ? https : http;
+  const port = target.port ? Number(target.port) : target.protocol === 'https:' ? 443 : 80;
+
+  const upstreamReq = lib.request(
+    {
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port,
+      path: `${target.pathname}${target.search}`,
+      method: 'GET'
+    },
+    (upRes) => {
+      const pass = ['content-type', 'content-length', 'etag', 'last-modified'];
+      res.status(upRes.statusCode || 200);
+      pass.forEach((h) => {
+        const v = upRes.headers[h];
+        if (v) res.setHeader(h, v);
+      });
+      res.setHeader('Content-Disposition', 'inline');
+      // Ensure the presigned response is not cached in a way that encourages reuse/downloading.
+      res.setHeader('Cache-Control', 'no-store, private, max-age=0, must-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      upRes.pipe(res);
+    }
+  );
+
+  upstreamReq.on('error', (err) => {
+    if (!res.headersSent) res.status(502).json({ error: 'media upstream failed' });
+    else res.end();
+  });
+  upstreamReq.end();
+});
+
+/**
+ * Same auth rules as public-read, but proxies bytes (forwards Range). HTML5 video breaks on 302 + Range to MinIO.
+ */
+v1.get('/media/public-stream', (req, res) => {
+  const bucket = String(req.query.bucket || '').trim();
+  const key = String(req.query.key || '').trim();
+  if (!bucket || !key || bucket !== minioBucket || !PUBLIC_MEDIA_KEY_RE.test(key)) {
+    return res.status(400).json({ error: 'invalid media reference' });
+  }
+  let presigned;
+  try {
+    presigned = createMinioPresignedGetUrl({ objectKey: key, expiresSeconds: 3600, forServerFetch: true });
+  } catch (e) {
+    return res.status(500).json({ error: 'failed to sign download' });
+  }
+
+  const target = new URL(presigned);
+  const lib = target.protocol === 'https:' ? https : http;
+  const port = target.port ? Number(target.port) : target.protocol === 'https:' ? 443 : 80;
+  const fwd = {};
+  if (req.headers.range) fwd.Range = req.headers.range;
+  if (req.headers['if-range']) fwd['If-Range'] = req.headers['if-range'];
+  if (req.headers['if-none-match']) fwd['If-None-Match'] = req.headers['if-none-match'];
+  if (req.headers['if-modified-since']) fwd['If-Modified-Since'] = req.headers['if-modified-since'];
+
+  const upstreamReq = lib.request(
+    {
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port,
+      path: `${target.pathname}${target.search}`,
+      method: 'GET',
+      headers: fwd
+    },
+    (upRes) => {
+      const pass = [
+        'content-type',
+        'content-length',
+        'content-range',
+        'accept-ranges',
+        'etag',
+        'last-modified',
+        'cache-control'
+      ];
+      const code = upRes.statusCode || 502;
+      res.status(code);
+      pass.forEach((h) => {
+        const v = upRes.headers[h];
+        if (v) res.setHeader(h, v);
+      });
+      res.setHeader('Content-Disposition', 'inline');
+      res.setHeader('Cache-Control', 'no-store, private, max-age=0, must-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      upRes.pipe(res);
+    }
+  );
+
+  upstreamReq.on('error', (err) => {
+    if (process.env.NODE_ENV !== 'test') {
+      console.error('[media/public-stream] upstream error', err?.message || err);
+    }
+    if (!res.headersSent) res.status(502).json({ error: 'media upstream failed' });
+    else res.end();
+  });
+  req.on('aborted', () => upstreamReq.destroy());
+  upstreamReq.end();
 });
 
 v1.post('/media/upload-url', authRequired, async (req, res) => {
@@ -2925,8 +3254,9 @@ v1.get('/feed/creators', authRequired, async (req, res) => {
           ...sanitizeCreator(row),
           username: row.username,
           displayName: row.display_name,
-          avatarUrl: row.avatar_url,
-          bio: row.bio
+          avatarUrl: rewriteStoredMediaUrlToPublicRead(row.avatar_url),
+          bio: row.bio,
+          about: mergeCreatorPublicAbout(row)
         },
         stats: {
           activeSubscribers: Number(row.active_subscriber_count || 0),
@@ -3793,6 +4123,104 @@ v1.get('/chat/rooms', authRequired, async (req, res) => {
     return res.json({ rooms: result.rows });
   } catch (error) {
     return res.status(500).json({ error: 'failed to fetch rooms' });
+  }
+});
+
+v1.get('/chat/rooms/summary', authRequired, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT cr.id,
+              cr.room_type,
+              cr.subject,
+              cr.created_at,
+              cr.updated_at,
+              other.user_id AS other_participant_user_id,
+              ua.username AS other_participant_username,
+              ua.display_name AS other_participant_display_name,
+              ua.avatar_url AS other_participant_avatar_url,
+              lm.id AS last_message_id,
+              lm.sender_user_id AS last_message_sender_user_id,
+              lm.body AS last_message_body,
+              lm.status AS last_message_status,
+              lm.sent_at AS last_message_sent_at,
+              lm.edited_at AS last_message_edited_at,
+              lm.deleted_at AS last_message_deleted_at,
+              COALESCE(uc.unread_count, 0)::int AS unread_count
+       FROM chat_room cr
+       INNER JOIN chat_room_participant me
+         ON me.room_id = cr.id
+        AND me.user_id = $1
+        AND me.left_at IS NULL
+       LEFT JOIN LATERAL (
+         SELECT p.user_id
+         FROM chat_room_participant p
+         WHERE p.room_id = cr.id
+           AND p.user_id <> $1
+           AND p.left_at IS NULL
+         ORDER BY p.joined_at ASC
+         LIMIT 1
+       ) other ON TRUE
+       LEFT JOIN user_account ua
+         ON ua.id = other.user_id
+       LEFT JOIN LATERAL (
+         SELECT m.id, m.sender_user_id, m.body, m.status, m.sent_at, m.edited_at, m.deleted_at
+         FROM message m
+         WHERE m.room_id = cr.id
+           AND m.context = 'direct'
+         ORDER BY m.sent_at DESC
+         LIMIT 1
+       ) lm ON TRUE
+       LEFT JOIN LATERAL (
+         SELECT COUNT(*)::int AS unread_count
+         FROM message m2
+         LEFT JOIN chat_room_read_state rs
+           ON rs.room_id = cr.id
+          AND rs.user_id = $1
+         WHERE m2.room_id = cr.id
+           AND m2.context = 'direct'
+           AND m2.sender_user_id <> $1
+           AND (
+             rs.last_read_at IS NULL
+             OR m2.sent_at > rs.last_read_at
+           )
+       ) uc ON TRUE
+       WHERE cr.is_active = TRUE
+       ORDER BY COALESCE(lm.sent_at, cr.updated_at, cr.created_at) DESC
+       LIMIT 100`,
+      [req.auth.sub]
+    );
+
+    const rooms = result.rows.map((row) => ({
+      id: row.id,
+      roomType: row.room_type,
+      subject: row.subject,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      otherParticipant: row.other_participant_user_id
+        ? {
+            userId: row.other_participant_user_id,
+            username: row.other_participant_username,
+            displayName: row.other_participant_display_name,
+            avatarUrl: rewriteStoredMediaUrlToPublicRead(row.other_participant_avatar_url)
+          }
+        : null,
+      lastMessage: row.last_message_id
+        ? {
+            id: row.last_message_id,
+            senderUserId: row.last_message_sender_user_id,
+            body: row.last_message_body,
+            status: row.last_message_status,
+            sentAt: row.last_message_sent_at,
+            editedAt: row.last_message_edited_at,
+            deletedAt: row.last_message_deleted_at
+          }
+        : null,
+      unreadCount: Number(row.unread_count || 0)
+    }));
+
+    return res.json({ rooms });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to fetch chat room summary' });
   }
 });
 
@@ -5066,6 +5494,7 @@ v1.get('/streams/live', async (req, res) => {
               cp.stage_name,
               ua.username,
               ua.display_name,
+              ua.avatar_url,
               COALESCE(viewers.active_viewer_count, 0)::int AS active_viewer_count
        FROM live_session ls
        INNER JOIN creator_profile cp

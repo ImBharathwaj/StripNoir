@@ -13,6 +13,15 @@ This document describes how a web (or mobile-web) client should be structured, h
 
 **Contract source of truth:** `shared-contracts/openapi.yaml` (public Node routes). Chat transport shapes are described in `shared-contracts/internal-contracts.md` (JWT claims and event patterns); event payloads are JSON objects on the wire.
 
+## 1.1 Recommended Frontend Stack (Next.js)
+
+Use a lightweight Node.js framework with modern routing and an API client layer:
+
+- **Next.js (React + TypeScript)**
+- (Optional but recommended) A small client store (or React context) for auth/session, feeds, chat threads, notifications, live/call state.
+
+This repo focuses on backend + contract correctness. The frontend is built as an installable app (not a static HTML scaffold) so the UI can be iterated in vertical slices.
+
 ## 2. Local and deployed URLs
 
 **Docker Compose (host defaults from `infra/docker-compose.yml` and `infra/.env.example`):**
@@ -123,12 +132,10 @@ Documented in code and Node `publishChatEvent` / `publishNotifyEvent` usage; exa
 If you add the app beside `services/api` and `services/chat`:
 
 ```text
-apps/web/                 # or web/, frontend/
+services/frontend/       # Next.js (React + TypeScript) app
   src/
-    api/                  # fetch wrapper, openapi-generated types
-    realtime/             # WebSocket + long-poll managers, event reducer
-    features/             # auth, feed, creator, live, calls, chat, wallet
-    livekit/              # LiveKit room hooks
+    lib/                  # api client + token storage
+    app/                  # Next routes/pages
   public/
 ```
 
@@ -146,6 +153,50 @@ Keep **one** realtime manager per scope (e.g. one WS per active room, one notify
 | F5 | Live: list/detail/join, LiveKit viewer, room WS for chat/presence/tips | Node `/streams/*`, Go chat room |
 | F6 | Video calls: request/accept/join/extend/end + room WS | Node `/calls/*`, Go chat room |
 | F7 | Polish: offline, 429 UX, metrics-aware debouncing on fallback GETs | Optional: Node `/metrics.json` in dev |
+
+## 9.1 Frontend implementation status (in-repo)
+
+- F0: [x] Auth implemented in Next.js:
+  - `services/frontend/src/app/login`
+  - `services/frontend/src/app/register`
+  - `services/frontend/src/app/me`
+  - landing `/` redirect
+  - refresh-on-401 via `services/frontend/src/lib/apiClient.ts` calling `POST /api/v1/auth/refresh`
+- F1: [x] Profiles, feeds, content list/detail, basic navigation implemented in Next.js:
+  - `services/frontend/src/components/TopNav.tsx`
+  - `services/frontend/src/app/feed/creators`
+  - `services/frontend/src/app/creators/[id]`
+  - `services/frontend/src/app/feed/following`
+  - `services/frontend/src/app/feed/trending`
+  - `services/frontend/src/app/content/[id]`
+- F2: [x] Wallet display and basic payment actions implemented in Next.js:
+  - `services/frontend/src/app/wallet`
+  - Deposit (`POST /api/v1/payments/deposit`)
+  - Tip (`POST /api/v1/payments/tip`)
+  - Subscribe (`POST /api/v1/payments/subscribe`)
+- F3: [x] DM chat UI implemented in Next.js:
+  - `services/frontend/src/app/chat/rooms` (room list + create direct room)
+  - `services/frontend/src/app/chat/rooms/[roomId]` (message thread)
+  - REST messages via `GET/POST/PATCH/DELETE /api/v1/chat/rooms/:roomId/messages`
+  - realtime via `GET /api/v1/chat/ws-token` and websocket `wsUrl` returned by Node
+- F4: [x] Notification inbox + notify realtime implemented in Next.js:
+  - `services/frontend/src/app/notifications`
+  - REST: `GET /api/v1/notifications` + `POST /api/v1/notifications/read`
+  - realtime: `GET /api/v1/notifications/ws-token` and websocket updates (`notification.created`)
+- F5: [x] Live UI implemented in Next.js:
+  - list/detail/join: `services/frontend/src/app/live` + `services/frontend/src/app/live/[id]`
+  - LiveKit viewer wired via Node `livekit` credentials (`LiveKitViewer`)
+  - realtime room WS for chat/presence/tips using `GET /api/v1/chat/ws-token` and websocket `wsUrl`
+- F6: [x] Video call UI implemented in Next.js:
+  - requests: `services/frontend/src/app/calls` (create request + accept/decline incoming)
+  - detail controls: `services/frontend/src/app/calls/[id]` (join, extend, end)
+  - realtime room updates: websocket using `GET /api/v1/chat/ws-token?roomId=<call.roomId>` (presence + `call.*` events)
+- F7: [x] Offline + 429 UX improvements and GET request dedupe in Next.js:
+  - Offline banner: `services/frontend/src/components/NetworkBanner.tsx`
+  - 429 UX: `services/frontend/src/lib/apiClient.ts` includes `retry-after` messaging + bounded retry
+  - Fallback GET dedupe: `apiGet` dedupes in-flight identical GETs to reduce rate limit pressure
+
+The legacy static scaffold under `apps/` has been removed; `services/frontend/` is the current UI implementation path.
 
 ## 10. Testing strategy
 

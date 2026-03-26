@@ -1,0 +1,109 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Default = dark theme */
+:root {
+  color-scheme: dark;
+  /* Premium dark theme tokens */
+  --c-bg: 9 13 26;
+  --c-surface: 11 18 32;
+  --c-surface2: 15 23 42;
+  --c-border: 51 65 85;
+  --c-text: 255 255 255;
+  --c-muted: 186 200 216;
+  --c-accent: 37 99 235;
+  --c-danger: 239 68 68;
+  --c-warning: 251 191 36;
+  --c-success: 52 211 153;
+}
+
+html.light {
+  color-scheme: light;
+  --c-bg: 248 250 252;
+  --c-surface: 255 255 255;
+  --c-surface2: 241 245 249;
+  --c-border: 226 232 240;
+  --c-text: 15 23 42;
+  --c-muted: 100 116 139;
+  --c-accent: 37 99 235;
+  --c-danger: 220 38 38;
+  --c-warning: 217 119 6;
+  --c-success: 5 150 105;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: rgb(var(--c-bg));
+  color: rgb(var(--c-text));
+}
+
+/* Premium defaults */
+h1 {
+  font-size: 28px;
+  line-height: 1.1;
+  font-weight: 900;
+  letter-spacing: -0.02em;
+}
+h2 {
+  font-size: 20px;
+  line-height: 1.2;
+  font-weight: 900;
+  letter-spacing: -0.01em;
+}
+
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Skip link: off-screen until keyboard focus */
+.skip-to-main {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 200;
+  padding: 0.65rem 1rem;
+  margin: 0.5rem;
+  border-radius: 0.75rem;
+  background: rgb(var(--c-accent));
+  color: #fff;
+  font-weight: 800;
+  font-size: 0.875rem;
+  text-decoration: none;
+  transform: translateY(-120%);
+  transition: transform 0.15s ease;
+}
+.skip-to-main:focus {
+  transform: translateY(0);
+  outline: 2px solid #fff;
+  outline-offset: 2px;
+}
+
+html.light .shadow-card {
+  box-shadow: 0 8px 28px rgba(15, 23, 42, 0.08);
+}
+
+@layer base {
+  :where(a, button, input, textarea, select, summary):focus-visible {
+    outline: 2px solid rgb(var(--c-accent));
+    outline-offset: 2px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  .skip-to-main {
+    transition: none;
+  }
+}
