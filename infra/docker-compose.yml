@@ -11,6 +11,8 @@ services:
         condition: service_started
       chat:
         condition: service_started
+      frontend:
+        condition: service_started
     networks:
       - stripnoir
     profiles:
@@ -45,8 +47,9 @@ services:
       LIVE_AGGREGATE_DELEGATE: ${LIVE_AGGREGATE_DELEGATE:-}
       ALLOW_FREE_SUBSCRIPTION: ${ALLOW_FREE_SUBSCRIPTION:-}
       SUBSCRIBERS_ONLY_CATALOG: ${SUBSCRIBERS_ONLY_CATALOG:-}
-      # MinIO/S3 presigned upload URL generation
-      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://localhost:19000}
+      # MinIO/S3 presigned upload URL generation (PUBLIC URL must be browser-reachable; see minio-init CORS)
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://minio:9000}
+      MINIO_PUBLIC_URL: ${MINIO_PUBLIC_URL:-http://localhost:19000}
       MINIO_BUCKET: ${MINIO_BUCKET:-stripnoir}
       MINIO_REGION: ${MINIO_REGION:-us-east-1}
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
@@ -78,7 +81,7 @@ services:
     working_dir: /app
     command: >
       sh -lc "if [ -f go.mod ]; then
-        /usr/local/go/bin/go mod download && /usr/local/go/bin/go run ./cmd/main.go;
+        /usr/local/go/bin/go mod download && /usr/local/go/bin/go run ./cmd;
       else
         echo 'services/chat not initialized yet. Add Go realtime code to services/chat';
         tail -f /dev/null;
@@ -192,6 +195,33 @@ services:
     profiles:
       - worker
 
+  frontend:
+    build:
+      context: ../services/frontend
+    container_name: stripnoir-frontend
+    working_dir: /app
+    command: >
+      sh -lc "if [ ! -d node_modules ] || [ ! -f node_modules/@next/swc-linux-x64-gnu/next-swc.linux-x64-gnu.node ]; then
+        rm -rf node_modules/@next/swc-linux-x64-* 2>/dev/null || true;
+        npm ci;
+      elif [ ! -d node_modules/@livekit/components-react ] || [ ! -d node_modules/tailwindcss ]; then
+        npm ci;
+      fi;
+      npm run dev"
+    volumes:
+      - ../services/frontend:/app
+      - stripnoir_frontend_node_modules_glibc:/app/node_modules
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      # Must match browser-reachable MinIO (same as API MINIO_PUBLIC_URL) so <img src> URLs work
+      NEXT_PUBLIC_MEDIA_PUBLIC_BASE: ${MINIO_PUBLIC_URL:-http://localhost:19000}
+    depends_on:
+      api:
+        condition: service_started
+    networks:
+      - stripnoir
+
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.96.0
     container_name: stripnoir-otel
@@ -222,10 +252,41 @@ services:
     networks:
       - stripnoir
 
+  # One-shot: create bucket + CORS so browser PUTs to presigned URLs do not fail with NetworkError
+  minio-init:
+    image: minio/mc:latest
+    container_name: stripnoir-minio-init
+    depends_on:
+      minio:
+        condition: service_started
+    networks:
+      - stripnoir
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio123}
+      MINIO_BUCKET: ${MINIO_BUCKET:-stripnoir}
+    volumes:
+      - ./minio/bucket-cors.json:/tmp/cors.json:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+          mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" && break
+          sleep 1
+        done
+        mc mb "local/$$MINIO_BUCKET" --ignore-existing
+        mc cors set "local/$$MINIO_BUCKET" /tmp/cors.json
+        # Public read so avatars and media load in <img> / new tab (otherwise S3 returns AccessDenied XML)
+        mc anonymous set download "local/$$MINIO_BUCKET"
+        echo "MinIO bucket CORS + public read (download) configured."
+    restart: "no"
+
 volumes:
   pgdata:
   redisdata:
   miniodata:
+  stripnoir_frontend_node_modules_glibc:
 
 networks:
   stripnoir:
