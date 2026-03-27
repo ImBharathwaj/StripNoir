@@ -276,7 +276,10 @@ services:
           sleep 1
         done
         mc mb "local/$$MINIO_BUCKET" --ignore-existing
-        mc cors set "local/$$MINIO_BUCKET" /tmp/cors.json
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+          mc cors set "local/$$MINIO_BUCKET" /tmp/cors.json && break
+          sleep 1
+        done
         # Public read so avatars and media load in <img> / new tab (otherwise S3 returns AccessDenied XML)
         mc anonymous set download "local/$$MINIO_BUCKET"
         echo "MinIO bucket CORS + public read (download) configured."

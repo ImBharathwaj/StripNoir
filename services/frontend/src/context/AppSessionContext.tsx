@@ -26,6 +26,7 @@ export type SessionCreatorProfile = {
   verificationStatus: string;
   defaultSubscriptionPriceCredits: number;
   liveEnabled?: boolean;
+  chatEnabled?: boolean;
   videoCallEnabled?: boolean;
 } | null;
 

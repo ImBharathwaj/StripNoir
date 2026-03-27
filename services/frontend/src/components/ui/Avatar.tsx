@@ -28,7 +28,8 @@ export default function Avatar({
         alt={name || 'avatar'}
         width={size}
         height={size}
-        className="shrink-0 overflow-hidden rounded-full border border-border object-cover"
+        className="shrink-0 overflow-hidden rounded-full border border-border object-cover aspect-square"
+        style={{ width: size, height: size, minWidth: size, minHeight: size }}
       />
     );
   }
@@ -36,7 +37,7 @@ export default function Avatar({
   return (
     <div
       className="shrink-0 overflow-hidden rounded-full border border-border bg-surface2 text-white font-black flex items-center justify-center"
-      style={{ width: size, height: size }}
+      style={{ width: size, height: size, minWidth: size, minHeight: size }}
       aria-label={name || 'avatar'}
       title={name || 'avatar'}
     >

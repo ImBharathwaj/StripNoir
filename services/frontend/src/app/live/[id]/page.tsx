@@ -10,6 +10,8 @@ import LiveKitViewer, { type LiveKitCredentials } from "../../../components/live
 import Button from "../../../components/ui/Button";
 import { Card, CardBody, CardHeader } from "../../../components/ui/Card";
 import Badge from "../../../components/ui/Badge";
+import Avatar from "../../../components/ui/Avatar";
+import { displayableMediaUrl } from "../../../lib/publicMediaUrl";
 
 type LiveStream = {
   id: string;
@@ -17,6 +19,14 @@ type LiveStream = {
   livekitRoomName?: string | null;
   title: string;
   description?: string | null;
+  streamThumbnailUrl?: string | null;
+  startedAt?: string | null;
+  creator?: {
+    displayName?: string | null;
+    stageName?: string | null;
+    username?: string | null;
+    avatarUrl?: string | null;
+  };
   status: string;
   baseJoinPriceCredits?: number;
   extendPriceCredits?: number;
@@ -215,6 +225,12 @@ export default function LiveDetailPage() {
   const expiresMs = watchExpiresAt ? Date.parse(watchExpiresAt) : NaN;
   const secondsLeft = Number.isFinite(expiresMs) ? Math.max(0, Math.floor((expiresMs - nowMs) / 1000)) : null;
   const fmtCountdown = secondsLeft == null ? "—" : `${Math.floor(secondsLeft / 60)}:${String(secondsLeft % 60).padStart(2, "0")}`;
+  const startedMs = stream?.startedAt ? Date.parse(stream.startedAt) : NaN;
+  const elapsedMin = Number.isFinite(startedMs) ? Math.max(0, Math.floor((nowMs - startedMs) / 60000)) : null;
+  const creatorName =
+    stream?.creator?.displayName || stream?.creator?.stageName || stream?.creator?.username || "Creator";
+  const thumb = stream?.streamThumbnailUrl?.trim();
+  const thumbSrc = thumb ? displayableMediaUrl(thumb) || thumb : null;
 
   const showLiveKitUnavailable = realtimeActive && !isHost && !livekit?.url;
 
@@ -235,17 +251,31 @@ export default function LiveDetailPage() {
           <Card>
             <CardHeader>
               <div className="flex flex-wrap items-start justify-between gap-3">
-                <div>
-                  <div className="text-xl font-black text-text">{stream.title}</div>
-                  {stream.description ? <div className="mt-1 text-muted">{stream.description}</div> : null}
-                  <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted">
-                    <span>{activeViewers} active viewers (session)</span>
-                    {wsPresenceCount != null ? (
-                      <span>
-                        · {wsPresenceCount} WS presence{stream.stats?.aggregateSource ? ` (${stream.stats.aggregateSource})` : ""}
-                      </span>
-                    ) : null}
+                <div className="flex items-start gap-3">
+                  <Avatar name={creatorName} src={stream.creator?.avatarUrl || undefined} size={42} />
+                  <div>
+                    <div className="text-sm font-bold text-muted">{creatorName}</div>
+                    <div className="text-xl font-black text-text">{stream.title}</div>
+                    <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted">
+                      <span>{activeViewers} active viewers</span>
+                      <span>·</span>
+                      <span>{(stream.baseJoinPriceCredits ?? 0) > 0 ? `${stream.baseJoinPriceCredits} credits to watch` : "Free to watch"}</span>
+                      {elapsedMin != null ? (
+                        <>
+                          <span>·</span>
+                          <span>Live for {elapsedMin}m</span>
+                        </>
+                      ) : null}
+                    </div>
                   </div>
+                </div>
+                <div>
+                  {thumbSrc ? (
+                    <img src={thumbSrc} alt="live thumbnail" className="h-20 w-32 rounded-lg object-cover border border-border" />
+                  ) : null}
+                </div>
+                <div className="w-full">
+                  {stream.description ? <div className="mt-1 text-muted">{stream.description}</div> : null}
                 </div>
                 <div className="flex flex-col items-stretch gap-2 sm:items-end">
                   {!isHost && viewerJoined && secondsLeft != null ? (
@@ -271,6 +301,11 @@ export default function LiveDetailPage() {
                       </Button>
                     ) : null}
                   </div>
+                  {wsPresenceCount != null ? (
+                    <div className="text-[11px] text-muted">
+                      {wsPresenceCount} WS presence{stream.stats?.aggregateSource ? ` (${stream.stats.aggregateSource})` : ""}
+                    </div>
+                  ) : null}
                 </div>
               </div>
             </CardHeader>

@@ -167,6 +167,7 @@ CREATE TABLE IF NOT EXISTS creator_profile (
   verified_by UUID REFERENCES user_account(id),
   default_subscription_price_credits INTEGER NOT NULL DEFAULT 0 CHECK (default_subscription_price_credits >= 0),
   live_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  chat_enabled BOOLEAN NOT NULL DEFAULT FALSE,
   video_call_enabled BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()

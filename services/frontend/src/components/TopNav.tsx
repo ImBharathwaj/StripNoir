@@ -8,6 +8,7 @@ import { loadTokens } from '../lib/tokenStore';
 import { logout } from '../lib/authApi';
 import Button from './ui/Button';
 import Badge from './ui/Badge';
+import Avatar from './ui/Avatar';
 import Toast, { type ToastItem } from './ui/Toast';
 import { apiGetCached, invalidateApiGetCache } from '../lib/apiClient';
 import { subscribeNotifyWebSocket } from '../lib/notifyWebSocketHub';
@@ -15,7 +16,61 @@ import { appPathFromDeepLink, normalizeNotification } from '../lib/notificationU
 import ThemeToggle from './ThemeToggle';
 import { useAppSession } from '../context/AppSessionContext';
 
-type NavItem = { href: string; label: string };
+type NavItem = { href: string; label: string; icon: 'feed' | 'live' | 'calls' | 'chat' | 'notifications' | 'wallet' | 'account' };
+
+function NavIcon({ icon }: { icon: NavItem['icon'] }) {
+  const cls = 'h-4 w-4';
+  switch (icon) {
+    case 'feed':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={cls} aria-hidden="true">
+          <rect x="4" y="4" width="16" height="16" rx="2" />
+          <path d="M8 9h8M8 13h8M8 17h5" />
+        </svg>
+      );
+    case 'live':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={cls} aria-hidden="true">
+          <circle cx="12" cy="12" r="3" />
+          <path d="M5 8a8 8 0 0 0 0 8M19 8a8 8 0 0 1 0 8" />
+        </svg>
+      );
+    case 'calls':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={cls} aria-hidden="true">
+          <rect x="3" y="6" width="14" height="12" rx="2" />
+          <path d="m17 10 4-2v8l-4-2z" />
+        </svg>
+      );
+    case 'chat':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={cls} aria-hidden="true">
+          <path d="M21 12a8 8 0 0 1-8 8H7l-4 2 1.5-4A8 8 0 1 1 21 12Z" />
+        </svg>
+      );
+    case 'notifications':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={cls} aria-hidden="true">
+          <path d="M15 17H5l2-2v-4a5 5 0 1 1 10 0v4l2 2h-4Z" />
+          <path d="M10 20a2 2 0 0 0 4 0" />
+        </svg>
+      );
+    case 'wallet':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={cls} aria-hidden="true">
+          <rect x="3" y="6" width="18" height="12" rx="2" />
+          <path d="M16 12h4" />
+        </svg>
+      );
+    case 'account':
+      return (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={cls} aria-hidden="true">
+          <circle cx="12" cy="8" r="4" />
+          <path d="M4 20c1.5-4 5-6 8-6s6.5 2 8 6" />
+        </svg>
+      );
+  }
+}
 
 export default function TopNav() {
   const pathname = usePathname();
@@ -38,37 +93,26 @@ export default function TopNav() {
   }, []);
 
   const loggedIn = Boolean(user) || hasToken;
+  const accountName = user?.displayName || user?.username || (isCreator ? 'Creator' : 'User');
+  const accountInitial = accountName.trim().charAt(0).toUpperCase() || 'U';
 
   const primaryNav = useMemo((): NavItem[] => {
     if (!loggedIn) {
       return [
-        { href: '/feed/creators', label: 'Explore' },
-        { href: '/feed/trending', label: 'Trending' },
-        { href: '/live', label: 'Live' }
-      ];
-    }
-    if (isCreator) {
-      return [
-        { href: '/creator', label: 'Studio' },
-        { href: '/feed/creators', label: 'Discover' },
-        { href: '/live', label: 'Live' },
-        { href: '/calls', label: 'Calls' },
-        { href: '/chat/rooms', label: 'Chat' },
-        { href: '/notifications', label: 'Alerts' },
-        { href: '/wallet', label: 'Wallet' }
+        { href: '/feed/creators', label: 'Feed', icon: 'feed' },
+        { href: '/live', label: 'Live', icon: 'live' }
       ];
     }
     return [
-      { href: '/feed/creators', label: 'Feed' },
-      { href: '/feed/following', label: 'Following' },
-      { href: '/feed/trending', label: 'Trending' },
-      { href: '/live', label: 'Live' },
-      { href: '/calls', label: 'Calls' },
-      { href: '/chat/rooms', label: 'Chat' },
-      { href: '/notifications', label: 'Alerts' },
-      { href: '/wallet', label: 'Wallet' }
+      { href: '/feed/creators', label: 'Feed', icon: 'feed' },
+      { href: '/live', label: 'Live', icon: 'live' },
+      { href: '/calls', label: 'Call', icon: 'calls' },
+      { href: '/chat/rooms', label: 'Chat', icon: 'chat' },
+      { href: '/notifications', label: 'Notifications', icon: 'notifications' },
+      { href: '/wallet', label: 'Wallet', icon: 'wallet' },
+      { href: '/me', label: 'Account', icon: 'account' }
     ];
-  }, [loggedIn, isCreator]);
+  }, [loggedIn]);
 
   useEffect(() => {
     suppressNotifyToastRef.current = pathname.startsWith('/notifications');
@@ -165,15 +209,14 @@ export default function TopNav() {
 
         <nav className="hidden md:flex flex-1 flex-wrap items-center gap-1" aria-label="Primary">
           {primaryNav.map((item) => (
-            <Link key={item.href} href={item.href} className={navLinkClass(item.href)}>
-              {item.label}
+            <Link key={item.href} href={item.href} className={navLinkClass(item.href)} aria-label={item.label} title={item.label}>
+              <span className="inline-flex items-center gap-1">
+                <NavIcon icon={item.icon} />
+                <span className="sr-only">{item.label}</span>
+                {item.href === '/notifications' && unread > 0 ? <Badge variant="warning">{unread}</Badge> : null}
+              </span>
             </Link>
           ))}
-          {loggedIn ? (
-            <Link href="/me" className={navLinkClass('/me')}>
-              Profile
-            </Link>
-          ) : null}
         </nav>
 
         <div className="ml-auto flex items-center gap-2">
@@ -202,16 +245,17 @@ export default function TopNav() {
             <div className="relative">
               <button
                 type="button"
-                className="inline-flex items-center gap-2 rounded-xl border border-border bg-surface2 px-3 py-2 text-sm font-extrabold text-text hover:bg-surface2/80"
+                className="relative inline-flex items-center justify-center rounded-full border border-border bg-surface2 p-1 text-text hover:bg-surface2/80"
                 onClick={() => setProfileOpen((v) => !v)}
                 aria-expanded={profileOpen}
                 aria-haspopup="true"
                 aria-controls="account-menu-dropdown"
                 id="account-menu-button"
                 aria-label={unread > 0 ? `Account menu, ${unread} unread notifications` : 'Account menu'}
+                title="Account"
               >
-                Account
-                {unread > 0 ? <Badge variant="warning">{unread}</Badge> : null}
+                <Avatar name={user?.avatarUrl ? accountName : accountInitial} src={user?.avatarUrl || undefined} size={30} />
+                {unread > 0 ? <span className="absolute -right-1 -top-1"><Badge variant="warning">{unread}</Badge></span> : null}
               </button>
 
               {profileOpen ? (
@@ -265,18 +309,18 @@ export default function TopNav() {
           <div className="mx-auto max-w-6xl px-4 py-3 grid grid-cols-2 gap-2">
             {primaryNav.map((item) => (
               <Link key={item.href} href={item.href} className={navLinkClass(item.href)} onClick={() => setOpen(false)}>
-                {item.label}
+                <span className="inline-flex items-center gap-2">
+                  <NavIcon icon={item.icon} />
+                  <span>{item.label}</span>
+                  {item.href === '/notifications' && unread > 0 ? <Badge variant="warning">{unread}</Badge> : null}
+                </span>
               </Link>
             ))}
-            {loggedIn ? (
-              <Link href="/me" className={navLinkClass('/me')} onClick={() => setOpen(false)}>
-                Profile
-              </Link>
-            ) : (
+            {!loggedIn ? (
               <Link href="/register" className={navLinkClass('/register')} onClick={() => setOpen(false)}>
                 Sign up
               </Link>
-            )}
+            ) : null}
           </div>
         </nav>
       ) : null}

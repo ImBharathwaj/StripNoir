@@ -21,6 +21,7 @@ type CreatorProfile = {
   verificationStatus: string;
   defaultSubscriptionPriceCredits: number;
   liveEnabled: boolean;
+  chatEnabled: boolean;
   videoCallEnabled: boolean;
   createdAt: string;
   updatedAt: string;
@@ -265,6 +266,7 @@ export default function CreatorDetailPage() {
                   </div>
                   <div className="text-xs text-muted">
                     {creator.liveEnabled ? 'Live enabled' : 'Live disabled'} •{' '}
+                    {creator.chatEnabled ? 'Chat enabled' : 'Chat disabled'} •{' '}
                     {creator.videoCallEnabled ? 'Video calls enabled' : 'Video calls disabled'}
                   </div>
                   {error?.toLowerCase().includes('insufficient credits') ? (
