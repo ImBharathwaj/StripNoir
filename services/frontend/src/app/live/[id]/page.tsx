@@ -8,8 +8,7 @@ import { trackEvent } from "../../../lib/analytics";
 import { subscribeRoomWebSocket } from "../../../lib/roomWebSocketHub";
 import LiveKitViewer, { type LiveKitCredentials } from "../../../components/live/LiveKitViewer";
 import Button from "../../../components/ui/Button";
-import { Card, CardBody, CardHeader } from "../../../components/ui/Card";
-import Badge from "../../../components/ui/Badge";
+import { Card, CardHeader } from "../../../components/ui/Card";
 import Avatar from "../../../components/ui/Avatar";
 import { displayableMediaUrl } from "../../../lib/publicMediaUrl";
 
@@ -43,14 +42,6 @@ type ChatEvent = {
   payload?: any;
 };
 
-type TipEntry = {
-  id: string;
-  fromUserId: string;
-  creatorUserId: string;
-  amountCredits: number;
-  at: number;
-};
-
 function readWatchExpires(viewer: any): string | null {
   if (!viewer) return null;
   const v = viewer.watch_expires_at ?? viewer.watchExpiresAt;
@@ -76,8 +67,6 @@ export default function LiveDetailPage() {
   const realtimeActive = viewerJoined || isHost;
 
   const [activeViewers, setActiveViewers] = useState<number>(0);
-  const [wsPresenceCount, setWsPresenceCount] = useState<number | null>(null);
-  const [tips, setTips] = useState<TipEntry[]>([]);
   const [watchExpiresAt, setWatchExpiresAt] = useState<string | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [extendBusy, setExtendBusy] = useState(false);
@@ -99,8 +88,6 @@ export default function LiveDetailPage() {
         if (cancelled) return;
         setStream(data.stream || null);
         setActiveViewers(data.stream?.stats?.activeViewers ?? 0);
-        const wsC = data.stream?.stats?.wsViewerConnections;
-        if (typeof wsC === "number") setWsPresenceCount(wsC);
       } catch (err: any) {
         if (err?.status === 401 || err?.message === "not authenticated") {
           router.replace("/login");
@@ -135,23 +122,6 @@ export default function LiveDetailPage() {
             const p = evt.payload || {};
             const exp = p.watchExpiresAt ?? p.watch_expires_at;
             if (exp) setWatchExpiresAt(String(exp));
-          } else if (t === "live.ws_presence") {
-            const p = evt.payload || {};
-            if (typeof p.wsViewerCount === "number") {
-              setWsPresenceCount(p.wsViewerCount);
-            }
-          } else if (t === "tip.received") {
-            const p = evt.payload || {};
-            if (p.fromUserId && p.creatorUserId) {
-              const entry: TipEntry = {
-                id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-                fromUserId: String(p.fromUserId),
-                creatorUserId: String(p.creatorUserId),
-                amountCredits: Number(p.amountCredits || 0),
-                at: Date.now()
-              };
-              setTips((prev) => [entry, ...prev].slice(0, 20));
-            }
           } else if (t === "live.ended") {
             setActiveViewers((v) => Math.max(0, v - 1));
           }
@@ -301,65 +271,35 @@ export default function LiveDetailPage() {
                       </Button>
                     ) : null}
                   </div>
-                  {wsPresenceCount != null ? (
-                    <div className="text-[11px] text-muted">
-                      {wsPresenceCount} WS presence{stream.stats?.aggregateSource ? ` (${stream.stats.aggregateSource})` : ""}
-                    </div>
-                  ) : null}
                 </div>
               </div>
             </CardHeader>
           </Card>
 
-          <div className="grid gap-4 lg:grid-cols-3">
-            <div className="lg:col-span-2 space-y-4">
-              {showLiveKitUnavailable ? (
-                <div className="rounded-xl border border-border bg-surface2 p-4 text-muted">
-                  <div className="font-black text-warning">LiveKit unavailable (503)</div>
-                  <p className="mt-1 text-sm">
-                    The server does not have LiveKit configured or did not return viewer credentials. You can still use realtime
-                    chat/events for this room when connected; video requires LiveKit on the backend.
-                  </p>
-                </div>
-              ) : null}
-              {livekit?.url && livekit?.token ? (
-                <LiveKitViewer
-                  livekit={livekit}
-                  showPublisherControls={isHost}
-                  notConfiguredMessage="LiveKit is not configured on the server. Video playback is unavailable."
-                />
-              ) : isHost && realtimeActive && (!livekit?.url || !livekit?.token) ? (
-                <LiveKitViewer
-                  livekit={{ url: "", token: "", roomName: stream.livekitRoomName || "" }}
-                  showPublisherControls
-                  notConfiguredMessage="LiveKit is not configured. Host preview cannot start until the server exposes LiveKit URL and token."
-                />
-              ) : !realtimeActive ? (
-                <div className="rounded-xl border border-dashed border-border bg-surface2 p-6 text-center text-muted">
-                  Join the session to load the video player and start your watch window.
-                </div>
-              ) : null}
-            </div>
-
-            <Card>
-              <CardHeader>
-                <div className="font-black text-text">Tips</div>
-                <div className="text-xs text-muted">Recent tip.received events from the room</div>
-              </CardHeader>
-              <CardBody>
-                {tips.length === 0 ? <div className="text-sm text-muted">No tips yet.</div> : null}
-                <ul className="max-h-64 space-y-2 overflow-y-auto text-sm">
-                  {tips.map((t) => (
-                    <li key={t.id} className="rounded-lg border border-border bg-bg px-2 py-1.5">
-                      <Badge variant="warning">{t.amountCredits} credits</Badge>
-                      <span className="ml-2 text-muted">
-                        {new Date(t.at).toLocaleTimeString()} · from {t.fromUserId.slice(0, 8)}…
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              </CardBody>
-            </Card>
+          <div className="space-y-4">
+            {showLiveKitUnavailable ? (
+              <div className="rounded-xl border border-border bg-surface2 p-4 text-muted">
+                <div className="font-black text-warning">Video unavailable</div>
+                <p className="mt-1 text-sm">Live video is temporarily unavailable for this session.</p>
+              </div>
+            ) : null}
+            {livekit?.url && livekit?.token ? (
+              <LiveKitViewer
+                livekit={livekit}
+                showPublisherControls={isHost}
+                notConfiguredMessage="Live video is currently unavailable."
+              />
+            ) : isHost && realtimeActive && (!livekit?.url || !livekit?.token) ? (
+              <LiveKitViewer
+                livekit={{ url: "", token: "", roomName: stream.livekitRoomName || "" }}
+                showPublisherControls
+                notConfiguredMessage="Live video is currently unavailable."
+              />
+            ) : !realtimeActive ? (
+              <div className="rounded-xl border border-dashed border-border bg-surface2 p-6 text-center text-muted">
+                Join session to start watching.
+              </div>
+            ) : null}
           </div>
         </div>
       ) : null}

@@ -4,7 +4,6 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { apiGet, apiPost } from "../../lib/apiClient";
 import { Card, CardBody } from "../../components/ui/Card";
-import Badge from "../../components/ui/Badge";
 import Button from "../../components/ui/Button";
 import LiveCreatorSquareCard from "../../components/social/LiveCreatorSquareCard";
 import Input from "../../components/ui/Input";
@@ -40,17 +39,6 @@ type LiveStream = {
   };
 };
 
-type AvailableCreator = {
-  creator: {
-    id: string;
-    userId: string;
-    stageName?: string;
-    displayName?: string;
-    username?: string;
-    liveEnabled?: boolean;
-  };
-};
-
 function categoriesFromMetadata(meta: Record<string, unknown> | null | undefined): string[] {
   if (!meta || typeof meta !== "object") return [];
   const raw = meta.category ?? meta.categories;
@@ -63,12 +51,11 @@ function categoriesFromMetadata(meta: Record<string, unknown> | null | undefined
 
 export default function LiveListPage() {
   const router = useRouter();
-  const { isCreator, creatorProfile } = useAppSession();
+  const { user, isCreator, creatorProfile } = useAppSession();
   const [streams, setStreams] = useState<LiveStream[]>([]);
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [categoryFilter, setCategoryFilter] = useState<string>("");
-  const [availableCreators, setAvailableCreators] = useState<AvailableCreator[]>([]);
   const [startTitle, setStartTitle] = useState("");
   const [startPrice, setStartPrice] = useState("1");
   const [startBusy, setStartBusy] = useState(false);
@@ -79,13 +66,9 @@ export default function LiveListPage() {
     setBusy(true);
     setError(null);
     try {
-      const [data, creatorsData] = await Promise.all([
-        apiGet<{ streams: LiveStream[] }>("/streams/live"),
-        apiGet<{ creators: AvailableCreator[] }>("/feed/creators?limit=24&offset=0&availability=live")
-      ]);
+      const data = await apiGet<{ streams: LiveStream[] }>("/streams/live");
       if (!cancelled) {
         setStreams(data.streams || []);
-        setAvailableCreators(creatorsData.creators || []);
       }
     } catch (err: any) {
       if (err?.status === 401 || err?.message === "not authenticated") {
@@ -125,6 +108,11 @@ export default function LiveListPage() {
     return streams.filter((s) => categoriesFromMetadata(s.metadata).includes(categoryFilter));
   }, [streams, categoryFilter]);
 
+  const myLiveSession = useMemo(() => {
+    if (!user?.id) return null;
+    return streams.find((s) => s.creatorUserId === user.id && s.status === "live") || null;
+  }, [streams, user?.id]);
+
   async function onStartLive(e: React.FormEvent) {
     e.preventDefault();
     setStartBusy(true);
@@ -159,22 +147,40 @@ export default function LiveListPage() {
 
   return (
     <div className="py-4">
-      <h1>Live</h1>
-      <p className="mt-1 text-muted">Join active streams and see creators currently available for live sessions.</p>
-      <div className="mt-3">
-        <Button size="sm" variant="secondary" onClick={() => loadLive()}>
-          Refresh live list
-        </Button>
-      </div>
+      <h1>{isCreator ? "Go Live" : "Live"}</h1>
+      <p className="mt-1 text-muted">
+        {isCreator ? "Start your session with a title and watch price." : "Join active live sessions from creators."}
+      </p>
+
+      {!isCreator ? (
+        <div className="mt-3">
+          <Button size="sm" variant="secondary" onClick={() => loadLive()}>
+            Refresh live list
+          </Button>
+        </div>
+      ) : null}
 
       {isCreator ? (
-        <Card className="mt-4">
+        <Card className="mt-4 overflow-hidden">
+          <div className="h-1 bg-gradient-to-r from-accent via-success to-warning" />
           <CardBody>
-            <div className="mb-2 text-sm font-black text-text">Start live session</div>
+            <div className="mb-1 text-xs font-black uppercase tracking-[0.15em] text-muted">Creator studio</div>
+            <div className="text-lg font-black text-text">Start live session</div>
             {!creatorProfile?.liveEnabled ? (
-              <div className="text-sm text-warning">Enable live in Creator profile before starting a session.</div>
+              <div className="mt-2 text-sm text-warning">Enable live in your creator profile before starting a session.</div>
             ) : null}
-            <form className="mt-3 grid gap-3 sm:grid-cols-3" onSubmit={onStartLive}>
+            {myLiveSession ? (
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-surface2 px-3 py-3">
+                <div>
+                  <div className="text-xs font-bold uppercase tracking-[0.12em] text-success">Session active</div>
+                  <div className="text-sm font-extrabold text-text">{myLiveSession.title}</div>
+                </div>
+                <Button size="sm" onClick={() => router.push(`/live/${myLiveSession.id}`)}>
+                  Open live room
+                </Button>
+              </div>
+            ) : null}
+            <form className="mt-4 grid gap-3 sm:grid-cols-3" onSubmit={onStartLive}>
               <div className="sm:col-span-2">
                 <label className="mb-1 block text-xs font-bold text-muted">Live title</label>
                 <Input value={startTitle} onChange={(e) => setStartTitle(e.target.value)} placeholder="Session title" required />
@@ -200,33 +206,18 @@ export default function LiveListPage() {
               </div>
               <div className="flex items-end">
                 <Button type="submit" disabled={startBusy || !creatorProfile?.liveEnabled || !startTitle.trim()} className="w-full">
-                  {startBusy ? "Starting…" : "Start live"}
+                  {startBusy ? "Starting..." : "Start live"}
                 </Button>
               </div>
             </form>
           </CardBody>
         </Card>
       ) : null}
-      <Card className="mt-4">
-        <CardBody>
-          <div className="mb-2 text-sm font-black text-text">Creators available for live</div>
-          <div className="text-xs text-muted">Use these creators for live interactions even when they are not streaming at this moment.</div>
-          <div className="mt-3 flex flex-wrap gap-2">
-            {availableCreators.map((row) => (
-              <Badge key={row.creator.id}>
-                {row.creator.displayName || row.creator.stageName || row.creator.username || row.creator.id}
-              </Badge>
-            ))}
-            {!busy && availableCreators.length === 0 ? <span className="text-sm text-muted">No creators are available for live now.</span> : null}
-          </div>
-        </CardBody>
-      </Card>
-
 
       {error ? <div className="mt-3 font-bold text-danger">{error}</div> : null}
-      {busy ? <div className="mt-2 text-muted">Loading live sessions…</div> : null}
+      {busy ? <div className="mt-2 text-muted">Loading live sessions...</div> : null}
 
-      {allCategories.length > 0 ? (
+      {!isCreator && allCategories.length > 0 ? (
         <Card className="mt-4">
           <CardBody className="flex flex-wrap gap-2">
             <Button size="sm" variant={categoryFilter === "" ? "primary" : "secondary"} onClick={() => setCategoryFilter("")}>
@@ -246,21 +237,25 @@ export default function LiveListPage() {
         </Card>
       ) : null}
 
-      <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-        {filtered.map((s) => (
-          <LiveCreatorSquareCard
-            key={s.id}
-            stream={s}
-            primaryHref={`/live/${s.id}`}
-            primaryLabel={s.baseJoinPriceCredits > 0 ? `Join · ${s.baseJoinPriceCredits} cr` : "Join free"}
-          />
-        ))}
-      </div>
+      {!isCreator ? (
+        <>
+          <div className="mt-4 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {filtered.map((s) => (
+              <LiveCreatorSquareCard
+                key={s.id}
+                stream={s}
+                primaryHref={`/live/${s.id}`}
+                primaryLabel={s.baseJoinPriceCredits > 0 ? `Join · ${s.baseJoinPriceCredits} cr` : "Join free"}
+              />
+            ))}
+          </div>
 
-      {!busy && filtered.length === 0 ? (
-        <div className="mt-6 rounded-xl border border-border bg-surface2 p-4 text-muted">
-          {streams.length === 0 ? "No live sessions right now." : "No streams match this category."}
-        </div>
+          {!busy && filtered.length === 0 ? (
+            <div className="mt-6 rounded-xl border border-border bg-surface2 p-4 text-muted">
+              {streams.length === 0 ? "No live sessions right now." : "No streams match this category."}
+            </div>
+          ) : null}
+        </>
       ) : null}
     </div>
   );
