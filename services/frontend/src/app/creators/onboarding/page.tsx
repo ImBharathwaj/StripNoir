@@ -12,6 +12,7 @@ export default function CreatorOnboardingPage() {
   const [categoryTags, setCategoryTags] = useState('');
   const [defaultSubscriptionPriceCredits, setDefaultSubscriptionPriceCredits] = useState('10');
   const [liveEnabled, setLiveEnabled] = useState(true);
+  const [chatEnabled, setChatEnabled] = useState(true);
   const [videoCallEnabled, setVideoCallEnabled] = useState(true);
 
   const [busy, setBusy] = useState(false);
@@ -35,6 +36,7 @@ export default function CreatorOnboardingPage() {
         categoryTags: tags,
         defaultSubscriptionPriceCredits: Number(defaultSubscriptionPriceCredits),
         liveEnabled,
+        chatEnabled,
         videoCallEnabled
       });
 
@@ -78,6 +80,10 @@ export default function CreatorOnboardingPage() {
         <label style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
           <input type="checkbox" checked={liveEnabled} onChange={(e) => setLiveEnabled(e.target.checked)} />
           <div>Enable live streaming</div>
+        </label>
+        <label style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+          <input type="checkbox" checked={chatEnabled} onChange={(e) => setChatEnabled(e.target.checked)} />
+          <div>Enable direct chat</div>
         </label>
         <label style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
           <input type="checkbox" checked={videoCallEnabled} onChange={(e) => setVideoCallEnabled(e.target.checked)} />

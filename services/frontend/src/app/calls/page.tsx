@@ -9,7 +9,7 @@ import Input from "../../components/ui/Input";
 import { Card, CardBody, CardHeader } from "../../components/ui/Card";
 import Badge from "../../components/ui/Badge";
 import Avatar from "../../components/ui/Avatar";
-import LiveCreatorSquareCard, { type LiveStreamCardModel } from "../../components/social/LiveCreatorSquareCard";
+import AvailableCreatorCard, { type AvailableCreator } from "../../components/social/AvailableCreatorCard";
 
 type CallRequest = {
   id: string;
@@ -40,6 +40,8 @@ type CreatorProfile = {
     avatarUrl?: string | null;
   };
 };
+
+type AvailableCreatorRow = { creator: AvailableCreator };
 
 function displayUser(p: UserProfile | undefined) {
   const u = p?.user;
@@ -80,7 +82,7 @@ export default function CallsRequestsPage() {
   const [acceptCreditsPerBlock, setAcceptCreditsPerBlock] = useState("1");
   const [acceptBlockSeconds, setAcceptBlockSeconds] = useState("120");
 
-  const [liveStreams, setLiveStreams] = useState<LiveStreamCardModel[]>([]);
+  const [availableCreators, setAvailableCreators] = useState<AvailableCreator[]>([]);
 
   useEffect(() => {
     const c = searchParams.get("creator");
@@ -121,12 +123,14 @@ export default function CallsRequestsPage() {
     setError(null);
     setBusy(true);
     try {
-      const [inData, outData, liveData] = await Promise.all([
+      const [inData, outData, creatorsData] = await Promise.all([
         apiGet<IncomingOutgoingResponse>("/calls/requests/incoming"),
         apiGet<IncomingOutgoingResponse>("/calls/requests/outgoing"),
-        apiGet<{ streams: LiveStreamCardModel[] }>("/streams/live").catch(() => ({ streams: [] as LiveStreamCardModel[] }))
+        apiGet<{ creators: AvailableCreatorRow[] }>("/feed/creators?limit=24&offset=0&availability=video_call").catch(
+          () => ({ creators: [] as AvailableCreatorRow[] })
+        )
       ]);
-      setLiveStreams(liveData.streams || []);
+      setAvailableCreators((creatorsData.creators || []).map((row) => row.creator));
       const inc = inData.requests || [];
       const out = outData.requests || [];
       setIncoming(inc);
@@ -229,26 +233,23 @@ export default function CallsRequestsPage() {
       <p className="mt-1 text-muted">Request a creator, review incoming requests with clear pricing, then join the session from the call page.</p>
       {error ? <div className="mt-3 font-bold text-danger">{error}</div> : null}
 
-      {liveStreams.length > 0 ? (
-        <Card className="mt-4">
-          <CardHeader>Creators live now</CardHeader>
-          <CardBody>
-            <p className="mb-3 text-sm text-muted">
-              Creators who are broadcasting appear here with their profile photo. Request a call using their creator id prefilled.
-            </p>
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {liveStreams.map((s) => (
-                <LiveCreatorSquareCard
-                  key={s.id}
-                  stream={s}
-                  primaryHref={`/calls?creator=${encodeURIComponent(s.creatorId)}`}
-                  primaryLabel="Request call"
-                />
-              ))}
-            </div>
-          </CardBody>
-        </Card>
-      ) : null}
+      <Card className="mt-4">
+        <CardHeader>Creators available for calls</CardHeader>
+        <CardBody>
+          <div className="mb-3 text-sm text-muted">Only creators who enabled video calls are listed here.</div>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {availableCreators.map((creator) => (
+              <AvailableCreatorCard
+                key={creator.id}
+                creator={creator}
+                primaryHref={`/calls?creator=${encodeURIComponent(creator.id)}`}
+                primaryLabel="Request call"
+              />
+            ))}
+          </div>
+          {!busy && availableCreators.length === 0 ? <div className="text-sm text-muted">No creators are available for video calls right now.</div> : null}
+        </CardBody>
+      </Card>
 
       <Card className="mt-4">
         <CardHeader>Request a call</CardHeader>

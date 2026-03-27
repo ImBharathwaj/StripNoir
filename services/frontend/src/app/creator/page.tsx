@@ -40,6 +40,7 @@ export default function CreatorStudioPage() {
   const [tags, setTags] = useState("");
   const [price, setPrice] = useState("0");
   const [liveEnabled, setLiveEnabled] = useState(false);
+  const [chatEnabled, setChatEnabled] = useState(false);
   const [videoCallEnabled, setVideoCallEnabled] = useState(false);
   const [profileBusy, setProfileBusy] = useState(false);
   const [profileMsg, setProfileMsg] = useState<string | null>(null);
@@ -70,6 +71,7 @@ export default function CreatorStudioPage() {
     setTags(creatorProfile.categoryTags?.join(", ") || "");
     setPrice(String(creatorProfile.defaultSubscriptionPriceCredits ?? 0));
     setLiveEnabled(Boolean(creatorProfile.liveEnabled));
+    setChatEnabled(Boolean(creatorProfile.chatEnabled));
     setVideoCallEnabled(Boolean(creatorProfile.videoCallEnabled));
   }, [creatorProfile]);
 
@@ -104,6 +106,7 @@ export default function CreatorStudioPage() {
         categoryTags,
         defaultSubscriptionPriceCredits: Math.max(0, Number(price) || 0),
         liveEnabled,
+        chatEnabled,
         videoCallEnabled
       });
       await refresh();
@@ -222,11 +225,15 @@ export default function CreatorStudioPage() {
             <div className="flex flex-col justify-end gap-2">
               <label className="flex items-center gap-2 text-sm font-bold text-text">
                 <input type="checkbox" checked={liveEnabled} onChange={(e) => setLiveEnabled(e.target.checked)} />
-                Live enabled
+                Available for live
+              </label>
+              <label className="flex items-center gap-2 text-sm font-bold text-text">
+                <input type="checkbox" checked={chatEnabled} onChange={(e) => setChatEnabled(e.target.checked)} />
+                Available for chat
               </label>
               <label className="flex items-center gap-2 text-sm font-bold text-text">
                 <input type="checkbox" checked={videoCallEnabled} onChange={(e) => setVideoCallEnabled(e.target.checked)} />
-                Video calls enabled
+                Available for video calls
               </label>
             </div>
             {profileErr ? <p className="sm:col-span-2 text-sm font-bold text-danger">{profileErr}</p> : null}

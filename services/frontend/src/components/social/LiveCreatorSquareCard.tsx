@@ -22,6 +22,8 @@ export type LiveStreamCardModel = {
   stats?: {
     activeViewers?: number;
   };
+  startedAt?: string | null;
+  baseJoinPriceCredits?: number;
 };
 
 export default function LiveCreatorSquareCard({
@@ -38,6 +40,9 @@ export default function LiveCreatorSquareCard({
   const thumb = stream.streamThumbnailUrl?.trim();
   const thumbSrc = thumb ? displayableMediaUrl(thumb) || thumb : null;
   const avatarSrc = stream.creator?.avatarUrl || null;
+  const startedMs = stream.startedAt ? Date.parse(stream.startedAt) : NaN;
+  const elapsedMin = Number.isFinite(startedMs) ? Math.max(0, Math.floor((Date.now() - startedMs) / 60000)) : null;
+  const price = Number(stream.baseJoinPriceCredits || 0);
 
   return (
     <div className="overflow-hidden rounded-2xl border border-border bg-bg shadow-sm">
@@ -55,6 +60,10 @@ export default function LiveCreatorSquareCard({
             <div className="text-sm font-black text-white">{label}</div>
             <div className="mt-1 line-clamp-2 text-xs text-muted">{stream.title}</div>
             <div className="mt-1 text-[11px] text-muted">{stream.stats?.activeViewers ?? 0} watching</div>
+            <div className="mt-1 text-[11px] text-muted">
+              {price > 0 ? `${price} credits to watch` : "Free to watch"}
+              {elapsedMin != null ? ` · live ${elapsedMin}m` : ""}
+            </div>
           </div>
         </div>
       </div>

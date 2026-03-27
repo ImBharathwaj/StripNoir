@@ -9,7 +9,7 @@ import Button from '../../../components/ui/Button';
 import { Card, CardBody, CardHeader } from '../../../components/ui/Card';
 import Badge from '../../../components/ui/Badge';
 import Avatar from '../../../components/ui/Avatar';
-import LiveCreatorSquareCard, { type LiveStreamCardModel } from '../../../components/social/LiveCreatorSquareCard';
+import AvailableCreatorCard, { type AvailableCreator } from '../../../components/social/AvailableCreatorCard';
 
 type ChatRoomSummary = {
   id: string;
@@ -31,6 +31,8 @@ type ChatRoomSummary = {
   unreadCount: number;
 };
 
+type AvailableCreatorRow = { creator: AvailableCreator };
+
 export default function ChatRoomsPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -40,7 +42,7 @@ export default function ChatRoomsPage() {
 
   const [participantUserId, setParticipantUserId] = useState('');
   const [createBusy, setCreateBusy] = useState(false);
-  const [liveStreams, setLiveStreams] = useState<LiveStreamCardModel[]>([]);
+  const [availableCreators, setAvailableCreators] = useState<AvailableCreator[]>([]);
 
   useEffect(() => {
     const p = searchParams.get('participant');
@@ -54,13 +56,15 @@ export default function ChatRoomsPage() {
       setBusy(true);
       setError(null);
       try {
-        const [summary, liveData] = await Promise.all([
+        const [summary, creatorsData] = await Promise.all([
           apiGet<{ rooms: ChatRoomSummary[] }>('/chat/rooms/summary'),
-          apiGet<{ streams: LiveStreamCardModel[] }>('/streams/live').catch(() => ({ streams: [] as LiveStreamCardModel[] }))
+          apiGet<{ creators: AvailableCreatorRow[] }>('/feed/creators?limit=24&offset=0&availability=chat').catch(
+            () => ({ creators: [] as AvailableCreatorRow[] })
+          )
         ]);
         if (!cancelled) {
           setRooms(summary.rooms || []);
-          setLiveStreams(liveData.streams || []);
+          setAvailableCreators((creatorsData.creators || []).map((row) => row.creator));
         }
       } catch (err: any) {
         if (err?.status === 401 || err?.message === 'not authenticated') {
@@ -103,26 +107,23 @@ export default function ChatRoomsPage() {
       {error ? <div className="mt-3 text-danger font-bold">{error}</div> : null}
       {busy ? <div className="mt-2 text-muted">Loading...</div> : null}
 
-      {liveStreams.length > 0 ? (
-        <Card className="mt-4">
-          <CardHeader>Creators live now</CardHeader>
-          <CardBody>
-            <p className="mb-3 text-sm text-muted">
-              Open a direct message with a creator who is online (live). Their user id is prefilled in the form below.
-            </p>
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {liveStreams.map((s) => (
-                <LiveCreatorSquareCard
-                  key={s.id}
-                  stream={s}
-                  primaryHref={`/chat/rooms?participant=${encodeURIComponent(s.creatorUserId)}`}
-                  primaryLabel="Start DM"
-                />
-              ))}
-            </div>
-          </CardBody>
-        </Card>
-      ) : null}
+      <Card className="mt-4">
+        <CardHeader>Creators available for chat</CardHeader>
+        <CardBody>
+          <div className="mb-3 text-sm text-muted">Only creators who enabled direct chat are listed here.</div>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {availableCreators.map((creator) => (
+              <AvailableCreatorCard
+                key={creator.id}
+                creator={creator}
+                primaryHref={`/chat/rooms?participant=${encodeURIComponent(creator.userId)}`}
+                primaryLabel="Start DM"
+              />
+            ))}
+          </div>
+          {!busy && availableCreators.length === 0 ? <div className="text-sm text-muted">No creators are available for chat right now.</div> : null}
+        </CardBody>
+      </Card>
 
       <Card className="mt-4">
         <CardHeader>Create direct room</CardHeader>

@@ -8,8 +8,9 @@ import { trackEvent } from "../../../lib/analytics";
 import { subscribeRoomWebSocket } from "../../../lib/roomWebSocketHub";
 import LiveKitViewer, { type LiveKitCredentials } from "../../../components/live/LiveKitViewer";
 import Button from "../../../components/ui/Button";
-import { Card, CardBody, CardHeader } from "../../../components/ui/Card";
-import Badge from "../../../components/ui/Badge";
+import { Card, CardHeader } from "../../../components/ui/Card";
+import Avatar from "../../../components/ui/Avatar";
+import { displayableMediaUrl } from "../../../lib/publicMediaUrl";
 
 type LiveStream = {
   id: string;
@@ -17,6 +18,14 @@ type LiveStream = {
   livekitRoomName?: string | null;
   title: string;
   description?: string | null;
+  streamThumbnailUrl?: string | null;
+  startedAt?: string | null;
+  creator?: {
+    displayName?: string | null;
+    stageName?: string | null;
+    username?: string | null;
+    avatarUrl?: string | null;
+  };
   status: string;
   baseJoinPriceCredits?: number;
   extendPriceCredits?: number;
@@ -31,14 +40,6 @@ type LiveStream = {
 type ChatEvent = {
   eventType?: string;
   payload?: any;
-};
-
-type TipEntry = {
-  id: string;
-  fromUserId: string;
-  creatorUserId: string;
-  amountCredits: number;
-  at: number;
 };
 
 function readWatchExpires(viewer: any): string | null {
@@ -66,8 +67,6 @@ export default function LiveDetailPage() {
   const realtimeActive = viewerJoined || isHost;
 
   const [activeViewers, setActiveViewers] = useState<number>(0);
-  const [wsPresenceCount, setWsPresenceCount] = useState<number | null>(null);
-  const [tips, setTips] = useState<TipEntry[]>([]);
   const [watchExpiresAt, setWatchExpiresAt] = useState<string | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [extendBusy, setExtendBusy] = useState(false);
@@ -89,8 +88,6 @@ export default function LiveDetailPage() {
         if (cancelled) return;
         setStream(data.stream || null);
         setActiveViewers(data.stream?.stats?.activeViewers ?? 0);
-        const wsC = data.stream?.stats?.wsViewerConnections;
-        if (typeof wsC === "number") setWsPresenceCount(wsC);
       } catch (err: any) {
         if (err?.status === 401 || err?.message === "not authenticated") {
           router.replace("/login");
@@ -125,23 +122,6 @@ export default function LiveDetailPage() {
             const p = evt.payload || {};
             const exp = p.watchExpiresAt ?? p.watch_expires_at;
             if (exp) setWatchExpiresAt(String(exp));
-          } else if (t === "live.ws_presence") {
-            const p = evt.payload || {};
-            if (typeof p.wsViewerCount === "number") {
-              setWsPresenceCount(p.wsViewerCount);
-            }
-          } else if (t === "tip.received") {
-            const p = evt.payload || {};
-            if (p.fromUserId && p.creatorUserId) {
-              const entry: TipEntry = {
-                id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-                fromUserId: String(p.fromUserId),
-                creatorUserId: String(p.creatorUserId),
-                amountCredits: Number(p.amountCredits || 0),
-                at: Date.now()
-              };
-              setTips((prev) => [entry, ...prev].slice(0, 20));
-            }
           } else if (t === "live.ended") {
             setActiveViewers((v) => Math.max(0, v - 1));
           }
@@ -215,6 +195,12 @@ export default function LiveDetailPage() {
   const expiresMs = watchExpiresAt ? Date.parse(watchExpiresAt) : NaN;
   const secondsLeft = Number.isFinite(expiresMs) ? Math.max(0, Math.floor((expiresMs - nowMs) / 1000)) : null;
   const fmtCountdown = secondsLeft == null ? "—" : `${Math.floor(secondsLeft / 60)}:${String(secondsLeft % 60).padStart(2, "0")}`;
+  const startedMs = stream?.startedAt ? Date.parse(stream.startedAt) : NaN;
+  const elapsedMin = Number.isFinite(startedMs) ? Math.max(0, Math.floor((nowMs - startedMs) / 60000)) : null;
+  const creatorName =
+    stream?.creator?.displayName || stream?.creator?.stageName || stream?.creator?.username || "Creator";
+  const thumb = stream?.streamThumbnailUrl?.trim();
+  const thumbSrc = thumb ? displayableMediaUrl(thumb) || thumb : null;
 
   const showLiveKitUnavailable = realtimeActive && !isHost && !livekit?.url;
 
@@ -235,17 +221,31 @@ export default function LiveDetailPage() {
           <Card>
             <CardHeader>
               <div className="flex flex-wrap items-start justify-between gap-3">
-                <div>
-                  <div className="text-xl font-black text-text">{stream.title}</div>
-                  {stream.description ? <div className="mt-1 text-muted">{stream.description}</div> : null}
-                  <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted">
-                    <span>{activeViewers} active viewers (session)</span>
-                    {wsPresenceCount != null ? (
-                      <span>
-                        · {wsPresenceCount} WS presence{stream.stats?.aggregateSource ? ` (${stream.stats.aggregateSource})` : ""}
-                      </span>
-                    ) : null}
+                <div className="flex items-start gap-3">
+                  <Avatar name={creatorName} src={stream.creator?.avatarUrl || undefined} size={42} />
+                  <div>
+                    <div className="text-sm font-bold text-muted">{creatorName}</div>
+                    <div className="text-xl font-black text-text">{stream.title}</div>
+                    <div className="mt-2 flex flex-wrap gap-2 text-xs text-muted">
+                      <span>{activeViewers} active viewers</span>
+                      <span>·</span>
+                      <span>{(stream.baseJoinPriceCredits ?? 0) > 0 ? `${stream.baseJoinPriceCredits} credits to watch` : "Free to watch"}</span>
+                      {elapsedMin != null ? (
+                        <>
+                          <span>·</span>
+                          <span>Live for {elapsedMin}m</span>
+                        </>
+                      ) : null}
+                    </div>
                   </div>
+                </div>
+                <div>
+                  {thumbSrc ? (
+                    <img src={thumbSrc} alt="live thumbnail" className="h-20 w-32 rounded-lg object-cover border border-border" />
+                  ) : null}
+                </div>
+                <div className="w-full">
+                  {stream.description ? <div className="mt-1 text-muted">{stream.description}</div> : null}
                 </div>
                 <div className="flex flex-col items-stretch gap-2 sm:items-end">
                   {!isHost && viewerJoined && secondsLeft != null ? (
@@ -276,55 +276,30 @@ export default function LiveDetailPage() {
             </CardHeader>
           </Card>
 
-          <div className="grid gap-4 lg:grid-cols-3">
-            <div className="lg:col-span-2 space-y-4">
-              {showLiveKitUnavailable ? (
-                <div className="rounded-xl border border-border bg-surface2 p-4 text-muted">
-                  <div className="font-black text-warning">LiveKit unavailable (503)</div>
-                  <p className="mt-1 text-sm">
-                    The server does not have LiveKit configured or did not return viewer credentials. You can still use realtime
-                    chat/events for this room when connected; video requires LiveKit on the backend.
-                  </p>
-                </div>
-              ) : null}
-              {livekit?.url && livekit?.token ? (
-                <LiveKitViewer
-                  livekit={livekit}
-                  showPublisherControls={isHost}
-                  notConfiguredMessage="LiveKit is not configured on the server. Video playback is unavailable."
-                />
-              ) : isHost && realtimeActive && (!livekit?.url || !livekit?.token) ? (
-                <LiveKitViewer
-                  livekit={{ url: "", token: "", roomName: stream.livekitRoomName || "" }}
-                  showPublisherControls
-                  notConfiguredMessage="LiveKit is not configured. Host preview cannot start until the server exposes LiveKit URL and token."
-                />
-              ) : !realtimeActive ? (
-                <div className="rounded-xl border border-dashed border-border bg-surface2 p-6 text-center text-muted">
-                  Join the session to load the video player and start your watch window.
-                </div>
-              ) : null}
-            </div>
-
-            <Card>
-              <CardHeader>
-                <div className="font-black text-text">Tips</div>
-                <div className="text-xs text-muted">Recent tip.received events from the room</div>
-              </CardHeader>
-              <CardBody>
-                {tips.length === 0 ? <div className="text-sm text-muted">No tips yet.</div> : null}
-                <ul className="max-h-64 space-y-2 overflow-y-auto text-sm">
-                  {tips.map((t) => (
-                    <li key={t.id} className="rounded-lg border border-border bg-bg px-2 py-1.5">
-                      <Badge variant="warning">{t.amountCredits} credits</Badge>
-                      <span className="ml-2 text-muted">
-                        {new Date(t.at).toLocaleTimeString()} · from {t.fromUserId.slice(0, 8)}…
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              </CardBody>
-            </Card>
+          <div className="space-y-4">
+            {showLiveKitUnavailable ? (
+              <div className="rounded-xl border border-border bg-surface2 p-4 text-muted">
+                <div className="font-black text-warning">Video unavailable</div>
+                <p className="mt-1 text-sm">Live video is temporarily unavailable for this session.</p>
+              </div>
+            ) : null}
+            {livekit?.url && livekit?.token ? (
+              <LiveKitViewer
+                livekit={livekit}
+                showPublisherControls={isHost}
+                notConfiguredMessage="Live video is currently unavailable."
+              />
+            ) : isHost && realtimeActive && (!livekit?.url || !livekit?.token) ? (
+              <LiveKitViewer
+                livekit={{ url: "", token: "", roomName: stream.livekitRoomName || "" }}
+                showPublisherControls
+                notConfiguredMessage="Live video is currently unavailable."
+              />
+            ) : !realtimeActive ? (
+              <div className="rounded-xl border border-dashed border-border bg-surface2 p-6 text-center text-muted">
+                Join session to start watching.
+              </div>
+            ) : null}
           </div>
         </div>
       ) : null}

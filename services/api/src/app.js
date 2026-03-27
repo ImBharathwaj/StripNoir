@@ -60,7 +60,20 @@ const livekitTokenTtlSeconds = Math.max(Number(process.env.LIVEKIT_TOKEN_TTL_SEC
 // server-side proxying (public-stream); must not be localhost inside a container unless MinIO is there.
 // MINIO_PUBLIC_URL: host embedded in presigned URLs sent to browsers / 302 redirects — reachable from users.
 const minioEndpoint = process.env.MINIO_ENDPOINT || 'http://localhost:19000';
-const minioPresignBaseUrl = process.env.MINIO_PUBLIC_URL || process.env.MINIO_PRESIGN_BASE_URL || minioEndpoint;
+function resolveMinioPresignBaseUrl() {
+  const explicit = process.env.MINIO_PUBLIC_URL || process.env.MINIO_PRESIGN_BASE_URL;
+  if (explicit) return explicit;
+  try {
+    const endpoint = new URL(minioEndpoint);
+    if (endpoint.hostname === 'minio') {
+      return `http://localhost:${process.env.MINIO_PORT || '19000'}`;
+    }
+  } catch {
+    // ignore invalid endpoint and use fallback
+  }
+  return minioEndpoint;
+}
+const minioPresignBaseUrl = resolveMinioPresignBaseUrl();
 const minioBucket = process.env.MINIO_BUCKET || 'stripnoir';
 const minioRegion = process.env.MINIO_REGION || 'us-east-1';
 const minioAccessKey = process.env.MINIO_ROOT_USER || '';
@@ -365,6 +378,7 @@ function sanitizeCreator(row) {
     verificationStatus: row.verification_status,
     defaultSubscriptionPriceCredits: row.default_subscription_price_credits,
     liveEnabled: row.live_enabled,
+    chatEnabled: row.chat_enabled,
     videoCallEnabled: row.video_call_enabled,
     createdAt: row.created_at,
     updatedAt: row.updated_at
@@ -1879,6 +1893,7 @@ v1.put('/creators/me', authRequired, async (req, res) => {
   const categoryTags = Array.isArray(req.body?.categoryTags) ? req.body.categoryTags.map((tag) => String(tag).trim()).filter(Boolean) : null;
   const defaultSubscriptionPriceCredits = req.body?.defaultSubscriptionPriceCredits !== undefined ? Math.max(Number(req.body.defaultSubscriptionPriceCredits), 0) : null;
   const liveEnabled = req.body?.liveEnabled !== undefined ? Boolean(req.body.liveEnabled) : null;
+  const chatEnabled = req.body?.chatEnabled !== undefined ? Boolean(req.body.chatEnabled) : null;
   const videoCallEnabled = req.body?.videoCallEnabled !== undefined ? Boolean(req.body.videoCallEnabled) : null;
 
   try {
@@ -1889,11 +1904,12 @@ v1.put('/creators/me', authRequired, async (req, res) => {
            category_tags = CASE WHEN $3::text[] IS NULL THEN category_tags ELSE $3::text[] END,
            default_subscription_price_credits = COALESCE($4, default_subscription_price_credits),
            live_enabled = COALESCE($5, live_enabled),
-           video_call_enabled = COALESCE($6, video_call_enabled),
+           chat_enabled = COALESCE($6, chat_enabled),
+           video_call_enabled = COALESCE($7, video_call_enabled),
            updated_at = now()
-       WHERE user_id = $7
+       WHERE user_id = $8
        RETURNING *`,
-      [stageName, about, categoryTags, defaultSubscriptionPriceCredits, liveEnabled, videoCallEnabled, req.auth.sub]
+      [stageName, about, categoryTags, defaultSubscriptionPriceCredits, liveEnabled, chatEnabled, videoCallEnabled, req.auth.sub]
     );
     if (updated.rows.length === 0) {
       return res.status(404).json({ error: 'creator profile not found' });
@@ -3206,10 +3222,15 @@ v1.get('/feed/creators', authRequired, async (req, res) => {
   const search = req.query?.search ? String(req.query.search).trim() : null;
   const category = req.query?.category ? String(req.query.category).trim() : null;
   const verificationStatus = req.query?.verification_status ? String(req.query.verification_status).trim() : null;
+  const availability = req.query?.availability ? String(req.query.availability).trim() : null;
 
   const allowedVerificationStatuses = new Set(['pending', 'approved', 'rejected']);
   if (verificationStatus && !allowedVerificationStatuses.has(verificationStatus)) {
     return res.status(400).json({ error: 'invalid verification_status (pending, approved, rejected)' });
+  }
+  const allowedAvailabilityFilters = new Set(['live', 'chat', 'video_call']);
+  if (availability && !allowedAvailabilityFilters.has(availability)) {
+    return res.status(400).json({ error: 'invalid availability (live, chat, video_call)' });
   }
 
   const searchPattern = search ? `%${search}%` : null;
@@ -3243,9 +3264,15 @@ v1.get('/feed/creators', authRequired, async (req, res) => {
            FROM unnest(cp.category_tags) t
            WHERE lower(t) = lower($6::text)
          ))
+         AND (
+           $7::text IS NULL
+           OR ($7::text = 'live' AND cp.live_enabled = TRUE)
+           OR ($7::text = 'chat' AND cp.chat_enabled = TRUE)
+           OR ($7::text = 'video_call' AND cp.video_call_enabled = TRUE)
+         )
        ORDER BY active_subscriber_count DESC, cp.updated_at DESC NULLS LAST, cp.created_at DESC
        LIMIT $2 OFFSET $3`,
-      [req.auth.sub, limit, offset, verificationStatus, searchPattern, category]
+      [req.auth.sub, limit, offset, verificationStatus, searchPattern, category, availability]
     );
 
     return res.json({
@@ -4246,6 +4273,20 @@ v1.post('/chat/rooms', authRequired, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+
+    if (otherCreator) {
+      const targetCreator = await client.query(
+        `SELECT chat_enabled
+         FROM creator_profile
+         WHERE user_id = $1
+         LIMIT 1`,
+        [participantUserId]
+      );
+      if (targetCreator.rows.length > 0 && !targetCreator.rows[0].chat_enabled) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ error: 'creator is not available for chat right now' });
+      }
+    }
 
     const otherUser = await client.query(
       `SELECT id FROM user_account

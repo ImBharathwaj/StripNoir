@@ -1,48 +1,65 @@
 "use client";
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { apiDelete, apiGet, apiPost } from '../../../lib/apiClient';
+import { apiGet } from '../../../lib/apiClient';
 import Button from '../../../components/ui/Button';
-import Input from '../../../components/ui/Input';
 import { Card, CardBody } from '../../../components/ui/Card';
 import Badge from '../../../components/ui/Badge';
 import Avatar from '../../../components/ui/Avatar';
-import CreatorBadge from '../../../components/ui/CreatorBadge';
-import PriceTag from '../../../components/ui/PriceTag';
+import { isVideoMediaAsset, resolveMediaAssetUrl } from '../../../lib/publicMediaUrl';
+import InlineVideoPlayer from '../../../components/media/InlineVideoPlayer';
+import FeedPostImage from '../../../components/media/FeedPostImage';
+import FeedColumn from '../../../components/layout/FeedColumn';
 
-type CreatorCard = {
-  creator: {
-    id: string;
-    userId: string;
-    stageName?: string;
-    displayName?: string;
-    username?: string;
-    avatarUrl?: string;
-    about?: string;
-    categoryTags?: string[];
-    verificationStatus?: string;
-  };
-  stats: {
-    activeSubscribers: number;
-    subscriptionPriceCredits: number;
-  };
-  viewer: {
-    isFollowing: boolean;
-    isSubscribed: boolean;
-  };
+type ContentCard = {
+  id: string;
+  creatorId: string;
+  title: string;
+  caption: string | null;
+  visibility: string;
+  status: string;
+  requiresPayment: boolean;
+  unlockPriceCredits: number;
+  publishedAt: string | null;
 };
+
+type CreatorMeta = {
+  id: string;
+  stageName?: string;
+  username?: string;
+  displayName?: string;
+  avatarUrl?: string;
+};
+
+type MediaAsset = {
+  id: string;
+  mediaType?: string;
+  mimeType?: string;
+  media_type?: string;
+  mime_type?: string;
+  objectKey?: string;
+  object_key?: string;
+  storageBucket?: string;
+  storage_bucket?: string;
+  originalFilename?: string;
+  original_filename?: string;
+  width?: number;
+  height?: number;
+  metadata?: any;
+};
+
+type FeedMode = 'public' | 'following';
 
 export default function CreatorsFeedPage() {
   const router = useRouter();
-  const [creators, setCreators] = useState<CreatorCard[]>([]);
+  const [mode, setMode] = useState<FeedMode>('public');
+  const [feed, setFeed] = useState<ContentCard[]>([]);
+  const [creatorsById, setCreatorsById] = useState<Record<string, CreatorMeta>>({});
+  const [mediaByContentId, setMediaByContentId] = useState<Record<string, MediaAsset[]>>({});
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [searchInput, setSearchInput] = useState('');
-  const [search, setSearch] = useState('');
-  const [category, setCategory] = useState('');
-  const [verificationStatus, setVerificationStatus] = useState('');
 
   useEffect(() => {
     let cancelled = false;
@@ -51,13 +68,35 @@ export default function CreatorsFeedPage() {
       setBusy(true);
       setError(null);
       try {
-        const qs = new URLSearchParams({ limit: '20', offset: '0' });
-        if (search.trim()) qs.set('search', search.trim());
-        if (category.trim()) qs.set('category', category.trim());
-        if (verificationStatus.trim()) qs.set('verification_status', verificationStatus.trim());
+        const endpoint = mode === 'following' ? '/feed/following?limit=20' : '/feed/trending?limit=20';
+        const data = await apiGet<{ feed: ContentCard[] }>(endpoint);
+        const visible = (data.feed || []).filter((p) => p.visibility === 'public' || p.visibility === 'followers');
+        if (!cancelled) setFeed(visible);
 
-        const data = await apiGet<{ creators: CreatorCard[] }>(`/feed/creators?${qs.toString()}`);
-        if (!cancelled) setCreators(data.creators || []);
+        const creatorIds = Array.from(new Set(visible.map((i) => i.creatorId)));
+        const creatorPairs = await Promise.all(
+          creatorIds.map(async (creatorId) => {
+            try {
+              const r = await apiGet<{ creator: CreatorMeta }>(`/creators/${creatorId}`);
+              return [creatorId, r.creator] as const;
+            } catch {
+              return [creatorId, { id: creatorId }] as const;
+            }
+          })
+        );
+        if (!cancelled) setCreatorsById(Object.fromEntries(creatorPairs));
+
+        const mediaPairs = await Promise.all(
+          visible.map(async (item) => {
+            try {
+              const r = await apiGet<{ media: MediaAsset[] }>(`/content/${item.id}`);
+              return [item.id, r.media || []] as const;
+            } catch {
+              return [item.id, []] as const;
+            }
+          })
+        );
+        if (!cancelled) setMediaByContentId(Object.fromEntries(mediaPairs));
       } catch (err: any) {
         if (err?.status === 401 || err?.message === 'not authenticated') {
           router.replace('/login');
@@ -73,204 +112,116 @@ export default function CreatorsFeedPage() {
     return () => {
       cancelled = true;
     };
-  }, [router, search, category, verificationStatus]);
+  }, [router, mode]);
 
-  async function onToggleFollow(card: CreatorCard) {
-    try {
-      if (card.viewer.isFollowing) {
-        await apiDelete(`/users/${card.creator.userId}/unfollow`);
-        setCreators((prev) =>
-          prev.map((c) =>
-            c.creator.id === card.creator.id
-              ? { ...c, viewer: { ...c.viewer, isFollowing: false } }
-              : c
-          )
-        );
-      } else {
-        await apiPost(`/users/${card.creator.userId}/follow`);
-        setCreators((prev) =>
-          prev.map((c) =>
-            c.creator.id === card.creator.id
-              ? { ...c, viewer: { ...c.viewer, isFollowing: true } }
-              : c
-          )
-        );
-      }
-    } catch (err: any) {
-      if (err?.status === 401 || err?.message === 'not authenticated') {
-        router.replace('/login');
-        return;
-      }
-      setError(err?.body?.error || err?.message || 'follow action failed');
-    }
+  function mediaPreview(m: MediaAsset): { src: string | null; video: boolean } {
+    const rec = m as unknown as Record<string, unknown>;
+    const video = isVideoMediaAsset(rec);
+    const src = resolveMediaAssetUrl(rec, video);
+    return { src, video };
   }
 
-  const categoryOptions = Array.from(
-    new Set(
-      creators.flatMap((c) => (c.creator.categoryTags || []).map((t) => t.trim()).filter(Boolean))
-    )
-  ).slice(0, 12);
+  const title = useMemo(() => (mode === 'following' ? 'Following feed' : 'Feed'), [mode]);
 
   return (
-    <div className="py-4">
-      <h1>Discover Creators</h1>
-      <div className="mt-2 text-muted">
-        Browse verified and emerging creators, compare pricing, then follow or subscribe.
+    <FeedColumn className="py-4">
+      <h1 className="text-center text-xl font-black tracking-tight">{title}</h1>
+      <div className="mt-2 flex justify-center gap-2">
+        <Button size="sm" variant={mode === 'public' ? 'primary' : 'secondary'} onClick={() => setMode('public')}>
+          Public
+        </Button>
+        <Button size="sm" variant={mode === 'following' ? 'primary' : 'secondary'} onClick={() => setMode('following')}>
+          Following
+        </Button>
       </div>
-      {error ? <div className="mt-3 text-danger font-bold">{error}</div> : null}
+      <div className="mt-1 text-center text-sm text-muted">
+        Showing creator uploads that are public or follower-visible.
+      </div>
+      {error ? <div className="text-danger font-bold mt-2 text-center">{error}</div> : null}
+      {busy ? <div className="text-muted mt-2 text-center">Loading...</div> : null}
 
-      <Card className="mt-4">
-        <CardBody className="space-y-3">
-          <div className="flex gap-2">
-            <Input
-              value={searchInput}
-              onChange={(e) => setSearchInput(e.target.value)}
-              placeholder="Search by username, display name, stage name, about..."
-              aria-label="Search creators"
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') setSearch(searchInput);
-              }}
-            />
-            <Button onClick={() => setSearch(searchInput)} variant="primary">
-              Search
-            </Button>
-            <Button
-              onClick={() => {
-                setSearchInput('');
-                setSearch('');
-                setCategory('');
-                setVerificationStatus('');
-              }}
-              variant="secondary"
-            >
-              Reset
-            </Button>
-          </div>
-
-          <div className="flex flex-wrap gap-2" role="group" aria-label="Filter by verification status">
-            <Button
-              variant={verificationStatus === '' ? 'primary' : 'secondary'}
-              size="sm"
-              aria-pressed={verificationStatus === ''}
-              onClick={() => setVerificationStatus('')}
-            >
-              All
-            </Button>
-            <Button
-              variant={verificationStatus === 'approved' ? 'primary' : 'secondary'}
-              size="sm"
-              aria-pressed={verificationStatus === 'approved'}
-              onClick={() => setVerificationStatus('approved')}
-            >
-              Verified
-            </Button>
-            <Button
-              variant={verificationStatus === 'pending' ? 'primary' : 'secondary'}
-              size="sm"
-              aria-pressed={verificationStatus === 'pending'}
-              onClick={() => setVerificationStatus('pending')}
-            >
-              Pending
-            </Button>
-            <Button
-              variant={verificationStatus === 'rejected' ? 'primary' : 'secondary'}
-              size="sm"
-              aria-pressed={verificationStatus === 'rejected'}
-              onClick={() => setVerificationStatus('rejected')}
-            >
-              Rejected
-            </Button>
-          </div>
-
-          {categoryOptions.length > 0 ? (
-            <div className="flex flex-wrap gap-2" role="group" aria-label="Filter by category">
-              <Button variant={category === '' ? 'primary' : 'secondary'} size="sm" aria-pressed={category === ''} onClick={() => setCategory('')}>
-                Any category
-              </Button>
-              {categoryOptions.map((t) => (
-                <Button
-                  key={t}
-                  variant={category === t ? 'primary' : 'secondary'}
-                  size="sm"
-                  aria-pressed={category === t}
-                  onClick={() => setCategory(t)}
-                >
-                  {t}
-                </Button>
-              ))}
-            </div>
-          ) : null}
-        </CardBody>
-      </Card>
-
-      {busy ? <div className="mt-4 text-muted">Loading creators...</div> : null}
-
-      <div className="mt-4 grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
-        {creators.map((card) => (
-          <Card key={card.creator.id}>
+      <div className="mt-5 grid gap-4">
+        {feed.map((c) => (
+          <Card key={c.id}>
             <CardBody>
               <div className="flex items-start justify-between gap-3">
-                <div className="flex items-start gap-3">
+                <div className="flex items-center gap-2">
                   <Avatar
-                    name={card.creator.displayName || card.creator.stageName || card.creator.username}
-                    src={card.creator.avatarUrl}
-                    size={46}
+                    name={
+                      creatorsById[c.creatorId]?.displayName ||
+                      creatorsById[c.creatorId]?.stageName ||
+                      creatorsById[c.creatorId]?.username
+                    }
+                    src={creatorsById[c.creatorId]?.avatarUrl}
+                    size={36}
                   />
                   <div>
-                    <Link href={`/creators/${card.creator.id}`} className="text-text text-lg font-black hover:underline">
-                      {card.creator.displayName || card.creator.stageName || card.creator.username || 'Creator'}
-                    </Link>
-                    <div className="mt-1">
-                      <CreatorBadge status={card.creator.verificationStatus} />
+                    <div className="text-sm text-white font-bold">
+                      {creatorsById[c.creatorId]?.displayName ||
+                        creatorsById[c.creatorId]?.stageName ||
+                        creatorsById[c.creatorId]?.username ||
+                        'Creator'}
+                    </div>
+                    <div className="text-xs text-muted">
+                      {c.publishedAt ? new Date(c.publishedAt).toLocaleString() : 'Draft/unscheduled'}
                     </div>
                   </div>
                 </div>
-
                 <div className="text-right">
-                  <PriceTag credits={card.stats.subscriptionPriceCredits} />
-                  <div className="mt-2 text-xs text-muted">{card.stats.activeSubscribers} subscribers</div>
+                  <Badge>{c.visibility}</Badge>
+                  {c.requiresPayment ? <Badge variant="warning">{c.unlockPriceCredits} credits</Badge> : <Badge variant="success">Free</Badge>}
                 </div>
               </div>
 
-              <div className="mt-3 text-sm text-muted min-h-[40px]">
-                {card.creator.about ? card.creator.about.slice(0, 120) : 'No bio yet.'}
+              <div className="mt-3">
+                <Link href={`/content/${c.id}`} className="text-white text-lg font-black hover:underline">
+                  {c.title}
+                </Link>
+                {c.caption ? <div className="text-muted mt-1">{c.caption.slice(0, 140)}</div> : null}
               </div>
 
-              <div className="mt-3 flex flex-wrap gap-2">
-                {(card.creator.categoryTags || []).slice(0, 4).map((t) => (
-                  <Badge key={t}>{t}</Badge>
-                ))}
-              </div>
+              {c.requiresPayment ? <div className="mt-2"><Badge variant="warning">Locked</Badge></div> : null}
 
-              <div className="mt-3 flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  {card.viewer.isSubscribed ? <Badge variant="success">Subscribed</Badge> : null}
-                  {card.viewer.isFollowing ? <Badge variant="accent">Following</Badge> : null}
-                </div>
-                <Button
-                  onClick={() => onToggleFollow(card)}
-                  variant={card.viewer.isFollowing ? 'secondary' : 'primary'}
-                  size="sm"
-                  aria-label={
-                    card.viewer.isFollowing
-                      ? `Unfollow ${card.creator.displayName || card.creator.stageName || card.creator.username || 'creator'}`
-                      : `Follow ${card.creator.displayName || card.creator.stageName || card.creator.username || 'creator'}`
+              <div className="mt-3 flex flex-col gap-2">
+                {(mediaByContentId[c.id] || []).slice(0, 4).map((m) => {
+                  const { src, video } = mediaPreview(m);
+                  const fileLabel = m.originalFilename || m.original_filename || null;
+                  const rec = m as unknown as Record<string, unknown>;
+                  if (!src) {
+                    return (
+                      <div
+                        key={m.id}
+                        className="rounded-lg border border-border bg-surface2 p-2 text-center text-[11px] text-muted"
+                      >
+                        No preview
+                      </div>
+                    );
                   }
-                >
-                  {card.viewer.isFollowing ? 'Unfollow' : 'Follow'}
-                </Button>
+                  return (
+                    <div
+                      key={m.id}
+                      className="w-full overflow-hidden rounded-lg border border-border bg-black/20"
+                    >
+                      {video ? (
+                        <InlineVideoPlayer src={src} label={fileLabel} dimensionSource={rec} />
+                      ) : (
+                        <FeedPostImage src={src} alt={fileLabel || 'Post image'} asset={rec} />
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </CardBody>
           </Card>
         ))}
       </div>
 
-      {!busy && creators.length === 0 ? (
-        <div className="mt-6 rounded-xl border border-border bg-surface2 p-4 text-muted">
-          No creators match your filters.
+      {!busy && feed.length === 0 ? (
+        <div className="mt-6 rounded-xl border border-border bg-surface2 p-4 text-muted text-center">
+          {mode === 'following' ? 'No posts from creators you follow yet.' : 'No public/follower posts available right now.'}
         </div>
       ) : null}
-    </div>
+    </FeedColumn>
   );
 }
 
