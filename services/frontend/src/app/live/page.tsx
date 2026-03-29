@@ -62,9 +62,12 @@ export default function LiveListPage() {
   const [thumbFile, setThumbFile] = useState<File | null>(null);
   const [thumbPreview, setThumbPreview] = useState<string | null>(null);
 
-  const loadLive = useCallback(async (cancelled = false) => {
-    setBusy(true);
-    setError(null);
+  const loadLive = useCallback(async (cancelled = false, options?: { silent?: boolean }) => {
+    const silent = Boolean(options?.silent);
+    if (!silent) {
+      setBusy(true);
+      setError(null);
+    }
     try {
       const data = await apiGet<{ streams: LiveStream[] }>("/streams/live");
       if (!cancelled) {
@@ -77,7 +80,7 @@ export default function LiveListPage() {
       }
       if (!cancelled) setError(err?.body?.error || err?.message || "failed to load live streams");
     } finally {
-      if (!cancelled) setBusy(false);
+      if (!cancelled && !silent) setBusy(false);
     }
   }, [router]);
 
@@ -85,7 +88,7 @@ export default function LiveListPage() {
     let cancelled = false;
     loadLive(cancelled);
     const timer = setInterval(() => {
-      if (!cancelled) loadLive(cancelled);
+      if (!cancelled) loadLive(cancelled, { silent: true });
     }, 8000);
     return () => {
       cancelled = true;
@@ -129,11 +132,13 @@ export default function LiveListPage() {
         ...(streamThumbnailUrl ? { streamThumbnailUrl } : {})
       });
       if (payload?.stream?.id) {
-        await loadLive();
+        setStreams((prev) => {
+          const next = prev.filter((stream) => stream.id !== payload.stream.id);
+          return [payload.stream, ...next];
+        });
         router.push(`/live/${payload.stream.id}`);
         return;
       }
-      router.refresh();
     } catch (err: any) {
       if (err?.status === 401 || err?.message === "not authenticated") {
         router.replace("/login");
@@ -154,7 +159,7 @@ export default function LiveListPage() {
 
       {!isCreator ? (
         <div className="mt-3">
-          <Button size="sm" variant="secondary" onClick={() => loadLive()}>
+          <Button size="sm" variant="secondary" onClick={() => loadLive(false)}>
             Refresh live list
           </Button>
         </div>

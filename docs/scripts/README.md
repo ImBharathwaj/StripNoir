@@ -18,3 +18,23 @@ cd /home/bharathwaj/Code/StripNoir
 ./docs/scripts/check_chat_message_ops.sh
 ./docs/scripts/check_phase1_e2e.sh
 ```
+
+
+# From repo root
+cd ~/Code/StripNoir/infra
+
+# Load env if you use it (optional)
+set -a && [ -f .env ] && . ./.env && set +a
+
+psql "postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@127.0.0.1:${POSTGRES_PORT:-15432}/${POSTGRES_DB:-stripnoir}"
+
+psql "postgresql://app:app@127.0.0.1:15432/stripnoir"
+
+cd ~/Code/StripNoir/infra
+sudo docker compose exec postgres psql -U app -d stripnoir
+
+# List tables
+\dt
+
+# Quit
+\q

@@ -16,7 +16,7 @@ import { appPathFromDeepLink, normalizeNotification } from '../lib/notificationU
 import ThemeToggle from './ThemeToggle';
 import { useAppSession } from '../context/AppSessionContext';
 
-type NavItem = { href: string; label: string; icon: 'feed' | 'live' | 'calls' | 'chat' | 'notifications' | 'wallet' | 'account' };
+type NavItem = { href: string; label: string; icon: 'feed' | 'creators' | 'live' | 'notifications' | 'wallet' | 'account' };
 
 function NavIcon({ icon }: { icon: NavItem['icon'] }) {
   const cls = 'h-4 w-4';
@@ -35,17 +35,13 @@ function NavIcon({ icon }: { icon: NavItem['icon'] }) {
           <path d="M5 8a8 8 0 0 0 0 8M19 8a8 8 0 0 1 0 8" />
         </svg>
       );
-    case 'calls':
+    case 'creators':
       return (
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={cls} aria-hidden="true">
-          <rect x="3" y="6" width="14" height="12" rx="2" />
-          <path d="m17 10 4-2v8l-4-2z" />
-        </svg>
-      );
-    case 'chat':
-      return (
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={cls} aria-hidden="true">
-          <path d="M21 12a8 8 0 0 1-8 8H7l-4 2 1.5-4A8 8 0 1 1 21 12Z" />
+          <path d="M16 21v-2a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v2" />
+          <circle cx="9.5" cy="7" r="3" />
+          <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+          <path d="M16 4.13a4 4 0 0 1 0 7.75" />
         </svg>
       );
     case 'notifications':
@@ -99,15 +95,15 @@ export default function TopNav() {
   const primaryNav = useMemo((): NavItem[] => {
     if (!loggedIn) {
       return [
-        { href: '/feed/creators', label: 'Feed', icon: 'feed' },
+        { href: '/feed', label: 'Feed', icon: 'feed' },
+        { href: '/creators', label: 'Creators', icon: 'creators' },
         { href: '/live', label: 'Live', icon: 'live' }
       ];
     }
     return [
-      { href: '/feed/creators', label: 'Feed', icon: 'feed' },
+      { href: '/feed', label: 'Feed', icon: 'feed' },
+      { href: '/creators', label: 'Creators', icon: 'creators' },
       { href: '/live', label: 'Live', icon: 'live' },
-      { href: '/calls', label: 'Call', icon: 'calls' },
-      { href: '/chat/rooms', label: 'Chat', icon: 'chat' },
       { href: '/notifications', label: 'Notifications', icon: 'notifications' },
       { href: '/wallet', label: 'Wallet', icon: 'wallet' },
       { href: '/me', label: 'Account', icon: 'account' }
@@ -198,8 +194,8 @@ export default function TopNav() {
 
   return (
     <header className="sticky top-0 z-50 border-b border-border bg-surface/90 backdrop-blur">
-      <div className="mx-auto flex max-w-6xl items-center gap-3 px-4 py-3">
-        <Link href="/" className="text-text font-black tracking-tight">
+      <div className="mx-auto flex w-full max-w-[min(100%,88rem)] min-w-0 items-center gap-3 px-4 py-3 sm:px-6 lg:px-8">
+        <Link href="/" className="shrink-0 text-text font-black tracking-tight">
           StripNoir
         </Link>
 
@@ -207,7 +203,7 @@ export default function TopNav() {
           {sessionLoading ? '…' : loggedIn ? (isCreator ? 'Creator' : 'Fan') : 'Guest'}
         </span>
 
-        <nav className="hidden md:flex flex-1 flex-wrap items-center gap-1" aria-label="Primary">
+        <nav className="hidden min-w-0 flex-1 flex-wrap items-center gap-1 md:flex" aria-label="Primary">
           {primaryNav.map((item) => (
             <Link key={item.href} href={item.href} className={navLinkClass(item.href)} aria-label={item.label} title={item.label}>
               <span className="inline-flex items-center gap-1">
@@ -219,11 +215,11 @@ export default function TopNav() {
           ))}
         </nav>
 
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ml-auto flex shrink-0 items-center gap-2">
           <ThemeToggle />
           <button
             type="button"
-            className="md:hidden rounded-xl border border-border bg-surface2 px-3 py-2 text-sm font-extrabold text-text"
+            className="shrink-0 rounded-xl border border-border bg-surface2 px-3 py-2 text-sm font-extrabold text-text md:hidden"
             onClick={() => setOpen((v) => !v)}
             aria-expanded={open}
             aria-controls="mobile-nav-menu"
@@ -306,7 +302,7 @@ export default function TopNav() {
           className="md:hidden border-t border-border bg-surface"
           aria-label="Mobile primary navigation"
         >
-          <div className="mx-auto max-w-6xl px-4 py-3 grid grid-cols-2 gap-2">
+          <div className="mx-auto grid w-full max-w-[min(100%,88rem)] grid-cols-1 gap-2 px-4 py-3 sm:grid-cols-2 sm:px-6 lg:px-8">
             {primaryNav.map((item) => (
               <Link key={item.href} href={item.href} className={navLinkClass(item.href)} onClick={() => setOpen(false)}>
                 <span className="inline-flex items-center gap-2">

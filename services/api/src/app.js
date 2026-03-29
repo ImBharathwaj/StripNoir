@@ -30,14 +30,17 @@ const chatServiceUrl = process.env.CHAT_SERVICE_URL || 'http://localhost:8080';
 /** Browser-facing chat/realtime origin (ws/long-poll). Falls back to CHAT_SERVICE_URL. Use behind API gateway. */
 const chatPublicUrl = process.env.CHAT_PUBLIC_URL || chatServiceUrl;
 const chatHistoryDelegate =
-  String(process.env.CHAT_HISTORY_DELEGATE || '').toLowerCase() === '1' ||
-  String(process.env.CHAT_HISTORY_DELEGATE || '').toLowerCase() === 'true';
+  !['0', 'false'].includes(String(process.env.CHAT_HISTORY_DELEGATE || '1').toLowerCase());
 const chatHistoryShadow =
   String(process.env.CHAT_HISTORY_SHADOW || '').toLowerCase() === '1' ||
   String(process.env.CHAT_HISTORY_SHADOW || '').toLowerCase() === 'true';
 const liveAggregateDelegate =
   String(process.env.LIVE_AGGREGATE_DELEGATE || '').toLowerCase() === '1' ||
   String(process.env.LIVE_AGGREGATE_DELEGATE || '').toLowerCase() === 'true';
+const liveCreatorPresenceTtlSeconds = Math.max(
+  15,
+  Number.parseInt(process.env.LIVE_CREATOR_PRESENCE_TTL_SECONDS || '30', 10) || 30
+);
 const chatInternalApiKey = process.env.CHAT_INTERNAL_API_KEY || '';
 /** When false (default), POST /creators/subscription is rejected — use POST /payments/subscribe for paid subs. */
 const allowFreeSubscription =
@@ -385,6 +388,24 @@ function sanitizeCreator(row) {
   };
 }
 
+let ensureCreatorProfileCompatibilityColumnsPromise = null;
+
+async function ensureCreatorProfileCompatibilityColumns() {
+  if (!ensureCreatorProfileCompatibilityColumnsPromise) {
+    ensureCreatorProfileCompatibilityColumnsPromise = pool.query(
+      `ALTER TABLE creator_profile
+         ADD COLUMN IF NOT EXISTS chat_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+         ADD COLUMN IF NOT EXISTS video_call_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+         ADD COLUMN IF NOT EXISTS live_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+         ADD COLUMN IF NOT EXISTS is_nsfw BOOLEAN NOT NULL DEFAULT TRUE`
+    ).catch((error) => {
+      ensureCreatorProfileCompatibilityColumnsPromise = null;
+      throw error;
+    });
+  }
+  await ensureCreatorProfileCompatibilityColumnsPromise;
+}
+
 function sanitizeContent(row) {
   return {
     id: row.id,
@@ -628,6 +649,17 @@ async function userHasCreatorProfile(userId) {
     [userId]
   );
   return r.rows.length > 0;
+}
+
+async function getCreatorProfileForUser(userId, db = pool) {
+  const result = await db.query(
+    `SELECT id, user_id, stage_name
+     FROM creator_profile
+     WHERE user_id = $1
+     LIMIT 1`,
+    [userId]
+  );
+  return result.rows[0] || null;
 }
 
 async function ensureWallet(client, userId) {
@@ -899,6 +931,40 @@ async function publishNotifyEvent(userId, eventType, payload) {
   }
 }
 
+async function createNotification({
+  userId,
+  type,
+  title,
+  body = null,
+  deepLink = null,
+  payload = null,
+  client = pool
+}) {
+  const inserted = await client.query(
+    `INSERT INTO notification (user_id, type, title, body, deep_link, payload)
+     VALUES ($1, $2, $3, $4, $5, COALESCE($6::jsonb, '{}'::jsonb))
+     RETURNING id, user_id, type, status, title, body, deep_link, payload, created_at, read_at, archived_at`,
+    [
+      userId,
+      type,
+      title,
+      body,
+      deepLink,
+      payload ? JSON.stringify(payload) : null
+    ]
+  );
+  return sanitizeNotificationRow(inserted.rows[0]);
+}
+
+async function pushNotification(notification) {
+  if (!notification?.userId) {
+    return;
+  }
+  await publishNotifyEvent(notification.userId, 'notification.created', {
+    notification
+  });
+}
+
 async function delegateChatHistory(req, method, pathAndQuery, jsonBody) {
   const url = `${chatServiceUrl}${pathAndQuery}`;
   const headers = {
@@ -971,6 +1037,68 @@ async function fetchLiveAggregateFromGo(sessionId) {
   return r.json();
 }
 
+function liveCreatorPresenceKey(sessionId) {
+  return `live:creator:presence:${sessionId}`;
+}
+
+async function hasLiveCreatorPresence(sessionId) {
+  try {
+    await ensureRedisConnected();
+    const value = await redisClient.get(liveCreatorPresenceKey(sessionId));
+    return Boolean(value);
+  } catch (error) {
+    return true;
+  }
+}
+
+async function getLiveCreatorPresenceMap(sessionIds) {
+  const map = new Map();
+  for (const sessionId of sessionIds) {
+    map.set(sessionId, true);
+  }
+  if (sessionIds.length === 0) {
+    return map;
+  }
+
+  try {
+    await ensureRedisConnected();
+    const values = await redisClient.mGet(sessionIds.map((sessionId) => liveCreatorPresenceKey(sessionId)));
+    sessionIds.forEach((sessionId, index) => {
+      map.set(sessionId, Boolean(values[index]));
+    });
+  } catch (error) {
+    return map;
+  }
+
+  return map;
+}
+
+async function touchLiveCreatorPresence(sessionId, creatorUserId) {
+  try {
+    await ensureRedisConnected();
+    await redisClient.set(
+      liveCreatorPresenceKey(sessionId),
+      JSON.stringify({
+        creatorUserId,
+        touchedAt: new Date().toISOString()
+      }),
+      { EX: liveCreatorPresenceTtlSeconds }
+    );
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+async function clearLiveCreatorPresence(sessionId) {
+  try {
+    await ensureRedisConnected();
+    await redisClient.del(liveCreatorPresenceKey(sessionId));
+  } catch (error) {
+    // best effort
+  }
+}
+
 async function getLiveSessionById(sessionId, viewerUserId = null, db = pool) {
   const result = await db.query(
     `SELECT ls.*,
@@ -1022,6 +1150,110 @@ async function getLiveSessionById(sessionId, viewerUserId = null, db = pool) {
         }
       : undefined
   };
+}
+
+async function endLiveSessionById(sessionId, options = {}) {
+  const {
+    client: providedClient = null,
+    reason = 'creator_ended',
+    viewerUserId = null
+  } = options;
+
+  const client = providedClient || await pool.connect();
+  const ownsTransaction = !providedClient;
+  let committed = false;
+
+  try {
+    if (ownsTransaction) {
+      await client.query('BEGIN');
+    }
+
+    const sessionResult = await client.query(
+      `SELECT ls.id, ls.room_id, ls.status
+       FROM live_session ls
+       WHERE ls.id = $1
+       LIMIT 1
+       FOR UPDATE`,
+      [sessionId]
+    );
+
+    if (sessionResult.rows.length === 0) {
+      if (ownsTransaction) {
+        await client.query('ROLLBACK');
+      }
+      return null;
+    }
+
+    const session = sessionResult.rows[0];
+    const transitioned = session.status === 'live';
+
+    if (transitioned) {
+      await client.query(
+        `UPDATE live_session
+         SET status = 'ended',
+             ended_at = COALESCE(ended_at, now()),
+             updated_at = now()
+         WHERE id = $1`,
+        [sessionId]
+      );
+
+      await client.query(
+        `UPDATE live_session_viewer
+         SET is_active = FALSE,
+             left_at = COALESCE(left_at, now()),
+             updated_at = now()
+         WHERE live_session_id = $1
+           AND is_active = TRUE`,
+        [sessionId]
+      );
+
+      if (session.room_id) {
+        await client.query(
+          `UPDATE chat_room
+           SET is_active = FALSE,
+               updated_at = now()
+           WHERE id = $1`,
+          [session.room_id]
+        );
+      }
+    }
+
+    const payload = await getLiveSessionById(sessionId, viewerUserId, client);
+
+    if (ownsTransaction) {
+      await client.query('COMMIT');
+      committed = true;
+    }
+
+    if (transitioned && ownsTransaction) {
+      await clearLiveCreatorPresence(sessionId);
+      if (session.room_id) {
+        publishChatEvent(session.room_id, 'live.ended', {
+          liveSessionId: sessionId,
+          reason
+        }).catch((error) => {
+          // eslint-disable-next-line no-console
+          console.error(error.message);
+        });
+      }
+    }
+
+    return {
+      transitioned,
+      roomId: session.room_id,
+      stream: payload?.stream || null,
+      viewerAccess: payload?.viewerAccess
+    };
+  } catch (error) {
+    if (ownsTransaction && !committed) {
+      await client.query('ROLLBACK');
+    }
+    throw error;
+  } finally {
+    if (!providedClient) {
+      client.release();
+    }
+  }
 }
 
 function isLiveKitConfigured() {
@@ -1688,6 +1920,7 @@ v1.post('/users/:id/follow', authRequired, async (req, res) => {
   }
 
   try {
+    const actor = await getCurrentUserProfile(req.auth.sub);
     const target = await pool.query(
       `SELECT id
        FROM user_account
@@ -1700,12 +1933,29 @@ v1.post('/users/:id/follow', authRequired, async (req, res) => {
       return res.status(404).json({ error: 'user not found' });
     }
 
-    await pool.query(
+    const inserted = await pool.query(
       `INSERT INTO follow_relation (follower_user_id, creator_user_id)
        VALUES ($1, $2)
-       ON CONFLICT (follower_user_id, creator_user_id) DO NOTHING`,
+       ON CONFLICT (follower_user_id, creator_user_id) DO NOTHING
+       RETURNING follower_user_id`,
       [req.auth.sub, targetUserId]
     );
+    if (inserted.rows.length > 0) {
+      const notification = await createNotification({
+        userId: targetUserId,
+        type: 'follow',
+        title: 'New follower',
+        body: `${actor?.display_name || actor?.username || 'Someone'} followed you`,
+        deepLink: (await userHasCreatorProfile(targetUserId)) ? '/creator' : '/notifications',
+        payload: {
+          followerUserId: req.auth.sub
+        }
+      });
+      pushNotification(notification).catch((error) => {
+        // eslint-disable-next-line no-console
+        console.error(error.message);
+      });
+    }
     return res.status(201).json({ followed: true });
   } catch (error) {
     return res.status(500).json({ error: 'failed to follow user' });
@@ -1892,24 +2142,27 @@ v1.put('/creators/me', authRequired, async (req, res) => {
   const about = req.body?.about !== undefined ? String(req.body.about).trim() : null;
   const categoryTags = Array.isArray(req.body?.categoryTags) ? req.body.categoryTags.map((tag) => String(tag).trim()).filter(Boolean) : null;
   const defaultSubscriptionPriceCredits = req.body?.defaultSubscriptionPriceCredits !== undefined ? Math.max(Number(req.body.defaultSubscriptionPriceCredits), 0) : null;
+  const isNsfw = req.body?.isNsfw !== undefined ? Boolean(req.body.isNsfw) : null;
   const liveEnabled = req.body?.liveEnabled !== undefined ? Boolean(req.body.liveEnabled) : null;
   const chatEnabled = req.body?.chatEnabled !== undefined ? Boolean(req.body.chatEnabled) : null;
   const videoCallEnabled = req.body?.videoCallEnabled !== undefined ? Boolean(req.body.videoCallEnabled) : null;
 
   try {
+    await ensureCreatorProfileCompatibilityColumns();
     const updated = await pool.query(
       `UPDATE creator_profile
        SET stage_name = COALESCE($1, stage_name),
            about = CASE WHEN $2::text IS NULL THEN about ELSE $2::text END,
            category_tags = CASE WHEN $3::text[] IS NULL THEN category_tags ELSE $3::text[] END,
            default_subscription_price_credits = COALESCE($4, default_subscription_price_credits),
-           live_enabled = COALESCE($5, live_enabled),
-           chat_enabled = COALESCE($6, chat_enabled),
-           video_call_enabled = COALESCE($7, video_call_enabled),
+           is_nsfw = COALESCE($5, is_nsfw),
+           live_enabled = COALESCE($6, live_enabled),
+           chat_enabled = COALESCE($7, chat_enabled),
+           video_call_enabled = COALESCE($8, video_call_enabled),
            updated_at = now()
-       WHERE user_id = $8
+       WHERE user_id = $9
        RETURNING *`,
-      [stageName, about, categoryTags, defaultSubscriptionPriceCredits, liveEnabled, chatEnabled, videoCallEnabled, req.auth.sub]
+      [stageName, about, categoryTags, defaultSubscriptionPriceCredits, isNsfw, liveEnabled, chatEnabled, videoCallEnabled, req.auth.sub]
     );
     if (updated.rows.length === 0) {
       return res.status(404).json({ error: 'creator profile not found' });
@@ -2164,8 +2417,10 @@ v1.get('/media/public-read', (req, res) => {
   // Proxy bytes instead of redirecting to the presigned MinIO URL.
   // This prevents the browser from receiving a direct downloadable MinIO link.
   let presigned;
+  let browserReachablePresigned;
   try {
     presigned = createMinioPresignedGetUrl({ objectKey: key, expiresSeconds: 3600, forServerFetch: true });
+    browserReachablePresigned = createMinioPresignedGetUrl({ objectKey: key, expiresSeconds: 3600 });
   } catch (e) {
     return res.status(500).json({ error: 'failed to sign download' });
   }
@@ -2199,8 +2454,13 @@ v1.get('/media/public-read', (req, res) => {
   );
 
   upstreamReq.on('error', (err) => {
-    if (!res.headersSent) res.status(502).json({ error: 'media upstream failed' });
-    else res.end();
+    if (!res.headersSent) {
+      if (browserReachablePresigned) {
+        return res.redirect(302, browserReachablePresigned);
+      }
+      return res.status(502).json({ error: 'media upstream failed' });
+    }
+    res.end();
   });
   upstreamReq.end();
 });
@@ -3133,9 +3393,14 @@ v1.get('/feed', authRequired, async (req, res) => {
       `SELECT cp.id, cp.creator_id, cp.title, cp.caption, cp.visibility, cp.status, cp.requires_payment, cp.unlock_price_credits, cp.published_at, cp.scheduled_for, cp.metadata, cp.created_at, cp.updated_at
        FROM content_post cp
        INNER JOIN creator_profile c ON c.id = cp.creator_id
-       INNER JOIN follow_relation fr ON fr.creator_user_id = c.user_id
-       WHERE fr.follower_user_id = $1
-         AND cp.status = 'published'
+       LEFT JOIN follow_relation fr
+         ON fr.creator_user_id = c.user_id
+        AND fr.follower_user_id = $1::uuid
+       WHERE cp.status = 'published'
+         AND (
+           cp.visibility = 'public'
+           OR (cp.visibility = 'followers' AND fr.follower_user_id IS NOT NULL)
+         )
          AND ($3::boolean = FALSE OR EXISTS (
            SELECT 1
            FROM subscription s
@@ -3222,15 +3487,10 @@ v1.get('/feed/creators', authRequired, async (req, res) => {
   const search = req.query?.search ? String(req.query.search).trim() : null;
   const category = req.query?.category ? String(req.query.category).trim() : null;
   const verificationStatus = req.query?.verification_status ? String(req.query.verification_status).trim() : null;
-  const availability = req.query?.availability ? String(req.query.availability).trim() : null;
 
   const allowedVerificationStatuses = new Set(['pending', 'approved', 'rejected']);
   if (verificationStatus && !allowedVerificationStatuses.has(verificationStatus)) {
     return res.status(400).json({ error: 'invalid verification_status (pending, approved, rejected)' });
-  }
-  const allowedAvailabilityFilters = new Set(['live', 'chat', 'video_call']);
-  if (availability && !allowedAvailabilityFilters.has(availability)) {
-    return res.status(400).json({ error: 'invalid availability (live, chat, video_call)' });
   }
 
   const searchPattern = search ? `%${search}%` : null;
@@ -3256,7 +3516,6 @@ v1.get('/feed/creators', authRequired, async (req, res) => {
        FROM creator_profile cp
        INNER JOIN user_account ua ON ua.id = cp.user_id
        WHERE ua.status = 'active'
-         AND cp.user_id <> $1::uuid
          AND ($4::text IS NULL OR cp.verification_status::text = $4::text)
          AND ($5::text IS NULL OR ua.username ILIKE $5::text OR ua.display_name ILIKE $5::text OR cp.stage_name ILIKE $5::text OR cp.about ILIKE $5::text)
          AND ($6::text IS NULL OR EXISTS (
@@ -3264,15 +3523,9 @@ v1.get('/feed/creators', authRequired, async (req, res) => {
            FROM unnest(cp.category_tags) t
            WHERE lower(t) = lower($6::text)
          ))
-         AND (
-           $7::text IS NULL
-           OR ($7::text = 'live' AND cp.live_enabled = TRUE)
-           OR ($7::text = 'chat' AND cp.chat_enabled = TRUE)
-           OR ($7::text = 'video_call' AND cp.video_call_enabled = TRUE)
-         )
        ORDER BY active_subscriber_count DESC, cp.updated_at DESC NULLS LAST, cp.created_at DESC
        LIMIT $2 OFFSET $3`,
-      [req.auth.sub, limit, offset, verificationStatus, searchPattern, category, availability]
+      [req.auth.sub, limit, offset, verificationStatus, searchPattern, category]
     );
 
     return res.json({
@@ -3358,6 +3611,7 @@ v1.post('/payments/subscribe', authRequired, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const actor = await getCurrentUserProfile(req.auth.sub, client);
     const creatorResult = await client.query(
       `SELECT id, user_id
        FROM creator_profile
@@ -3403,7 +3657,25 @@ v1.post('/payments/subscribe', authRequired, async (req, res) => {
       [req.auth.sub, creator.id]
     );
 
+    const creatorNotification = await createNotification({
+      userId: creator.user_id,
+      type: 'subscription',
+      title: 'New subscriber',
+      body: `${actor?.display_name || actor?.username || 'Someone'} subscribed to you`,
+      deepLink: '/creator',
+      payload: {
+        subscriberUserId: req.auth.sub,
+        creatorId: creator.id,
+        amountCredits
+      },
+      client
+    });
+
     await client.query('COMMIT');
+    pushNotification(creatorNotification).catch((error) => {
+      // eslint-disable-next-line no-console
+      console.error(error.message);
+    });
     return res.status(201).json({
       subscription: subscription.rows[0],
       transfer
@@ -4154,7 +4426,34 @@ v1.get('/chat/rooms', authRequired, async (req, res) => {
 });
 
 v1.get('/chat/rooms/summary', authRequired, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store, private, max-age=0, must-revalidate');
   try {
+    if (chatHistoryDelegate) {
+      try {
+        const delegated = await delegateChatHistory(req, 'GET', '/internal/history/rooms/summary');
+        if (delegated.status >= 200 && delegated.status < 300) {
+          const rooms = Array.isArray(delegated.body?.rooms)
+            ? delegated.body.rooms.map((room) => ({
+                ...room,
+                otherParticipant: room?.otherParticipant
+                  ? {
+                      ...room.otherParticipant,
+                      avatarUrl: rewriteStoredMediaUrlToPublicRead(room.otherParticipant.avatarUrl)
+                    }
+                  : null
+              }))
+            : [];
+          return res.status(delegated.status).json({ rooms });
+        }
+        if (delegated.status < 500) {
+          return res.status(delegated.status).json(delegated.body);
+        }
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.error('chat go summary delegation failed:', error.message);
+      }
+    }
+
     const result = await pool.query(
       `SELECT cr.id,
               cr.room_type,
@@ -4351,6 +4650,7 @@ v1.get('/chat/rooms/:id/messages', authRequired, async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 100);
   const before = req.query.before ? new Date(String(req.query.before)) : null;
   const beforeValue = before && !Number.isNaN(before.getTime()) ? before.toISOString() : null;
+  res.setHeader('Cache-Control', 'no-store, private, max-age=0, must-revalidate');
 
   try {
     if (!(await isRoomParticipant(roomId, req.auth.sub))) {
@@ -4371,8 +4671,17 @@ v1.get('/chat/rooms/:id/messages', authRequired, async (req, res) => {
         qs.set('before', beforeValue);
       }
       const pathAndQuery = `/internal/history/rooms/${encodeURIComponent(roomId)}/messages?${qs.toString()}`;
-      const { status, body } = await delegateChatHistory(req, 'GET', pathAndQuery);
-      return res.status(status).json(body);
+      try {
+        const delegated = await delegateChatHistory(req, 'GET', pathAndQuery);
+        if (delegated.status >= 200 && delegated.status < 500) {
+          return res.status(delegated.status).json(delegated.body);
+        }
+        // eslint-disable-next-line no-console
+        console.error('chat go message history returned 5xx:', delegated.status, delegated.body?.error || delegated.body);
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.error('chat go message history delegation failed:', error.message);
+      }
     }
 
     const result = await pool.query(
@@ -4410,11 +4719,11 @@ v1.get('/chat/rooms/:id/messages', authRequired, async (req, res) => {
 
 v1.post('/chat/rooms/:id/messages', authRequired, async (req, res) => {
   const roomId = req.params.id;
-  const body = String(req.body?.body || '').trim();
-  if (!body) {
+  const messageBody = String(req.body?.body || '').trim();
+  if (!messageBody) {
     return res.status(400).json({ error: 'body is required' });
   }
-  if (body.length > 4000) {
+  if (messageBody.length > 4000) {
     return res.status(400).json({ error: 'body is too long' });
   }
 
@@ -4431,17 +4740,49 @@ v1.post('/chat/rooms/:id/messages', authRequired, async (req, res) => {
       return res.status(403).json({ error: 'cannot send messages due to blocking' });
     }
 
+    const sender = await getCurrentUserProfile(req.auth.sub);
+    const recipientCreatorProfile = await getCreatorProfileForUser(otherUserId);
+
     if (chatHistoryDelegate) {
-      const pathAndQuery = `/internal/history/rooms/${encodeURIComponent(roomId)}/messages`;
-      const { status, body } = await delegateChatHistory(req, 'POST', pathAndQuery, { body });
-      return res.status(status).json(body);
+      try {
+        const pathAndQuery = `/internal/history/rooms/${encodeURIComponent(roomId)}/messages`;
+        const delegated = await delegateChatHistory(req, 'POST', pathAndQuery, { body: messageBody });
+        if (delegated.status >= 200 && delegated.status < 300) {
+          const delegatedMessage = delegated.body?.message;
+          if (delegatedMessage?.id) {
+            const notification = await createNotification({
+              userId: otherUserId,
+              type: 'message',
+              title: `New message from ${sender?.display_name || sender?.username || 'someone'}`,
+              body: messageBody,
+              deepLink: recipientCreatorProfile ? '/creator' : '/notifications',
+              payload: {
+                roomId,
+                senderUserId: req.auth.sub,
+                messageId: delegatedMessage.id
+              }
+            });
+            pushNotification(notification).catch((error) => {
+              // eslint-disable-next-line no-console
+              console.error(error.message);
+            });
+          }
+          return res.status(delegated.status).json(delegated.body);
+        }
+        if (delegated.status < 500) {
+          return res.status(delegated.status).json(delegated.body);
+        }
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.error('chat go delegation failed:', error.message);
+      }
     }
 
     const inserted = await pool.query(
       `INSERT INTO message (room_id, context, sender_user_id, body, attachments, status)
        VALUES ($1, 'direct', $2, $3, '[]'::jsonb, 'sent')
        RETURNING id, room_id, sender_user_id, body, attachments, status, sent_at, edited_at, deleted_at`,
-      [roomId, req.auth.sub, body]
+      [roomId, req.auth.sub, messageBody]
     );
 
     const message = inserted.rows[0];
@@ -4453,6 +4794,23 @@ v1.post('/chat/rooms/:id/messages', authRequired, async (req, res) => {
     );
 
     publishChatEvent(roomId, 'message.created', { message }).catch((error) => {
+      // eslint-disable-next-line no-console
+      console.error(error.message);
+    });
+
+    const notification = await createNotification({
+      userId: otherUserId,
+      type: 'message',
+      title: `New message from ${sender?.display_name || sender?.username || 'someone'}`,
+      body: messageBody,
+      deepLink: recipientCreatorProfile ? '/creator' : '/notifications',
+      payload: {
+        roomId,
+        senderUserId: req.auth.sub,
+        messageId: message.id
+      }
+    });
+    pushNotification(notification).catch((error) => {
       // eslint-disable-next-line no-console
       console.error(error.message);
     });
@@ -4628,6 +4986,21 @@ v1.post('/chat/rooms/:id/read', authRequired, async (req, res) => {
   const lastReadMessageId = req.body?.lastReadMessageId ? String(req.body.lastReadMessageId) : null;
 
   try {
+    if (chatHistoryDelegate) {
+      try {
+        const pathAndQuery = `/internal/history/rooms/${encodeURIComponent(roomId)}/read`;
+        const delegated = await delegateChatHistory(req, 'POST', pathAndQuery, {
+          lastReadMessageId
+        });
+        if (delegated.status >= 200 && delegated.status < 500) {
+          return res.status(delegated.status).json(delegated.body);
+        }
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.error('chat go read delegation failed:', error.message);
+      }
+    }
+
     if (!(await isRoomParticipant(roomId, req.auth.sub))) {
       return res.status(403).json({ error: 'not a participant of this room' });
     }
@@ -4691,6 +5064,7 @@ const createVideoCallRequestHandler = async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const actor = await getCurrentUserProfile(req.auth.sub, client);
 
     const creatorResult = await client.query(
       `SELECT id, user_id, video_call_enabled
@@ -4717,7 +5091,7 @@ const createVideoCallRequestHandler = async (req, res) => {
 
     const existingOpen = await client.query(
       `SELECT id, status, requested_at, expires_at
-       FROM video_call_request
+       FROM video_call_request vcr
        WHERE requester_user_id = $1
          AND target_creator_id = $2
          AND status IN ('requested', 'accepted', 'active')
@@ -4745,7 +5119,25 @@ const createVideoCallRequestHandler = async (req, res) => {
       ]
     );
 
+    const creatorNotification = await createNotification({
+      userId: creator.user_id,
+      type: 'video_call_request',
+      title: 'New call request',
+      body: `${actor?.display_name || actor?.username || 'Someone'} requested a 1:1 call`,
+      deepLink: '/creator',
+      payload: {
+        requestId: created.rows[0].id,
+        requesterUserId: req.auth.sub,
+        creatorId: creator.id
+      },
+      client
+    });
+
     await client.query('COMMIT');
+    pushNotification(creatorNotification).catch((error) => {
+      // eslint-disable-next-line no-console
+      console.error(error.message);
+    });
     return res.status(201).json({ request: created.rows[0] });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -4774,8 +5166,25 @@ v1.get('/calls/requests/incoming', authRequired, async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT id, requester_user_id, target_creator_id, status, requested_at, responded_at, expires_at, decline_reason, metadata
-       FROM video_call_request
+      `SELECT vcr.id,
+              vcr.requester_user_id,
+              vcr.target_creator_id,
+              vcr.status,
+              vcr.requested_at,
+              vcr.responded_at,
+              vcr.expires_at,
+              vcr.decline_reason,
+              vcr.metadata,
+              vcs.id AS session_id,
+              vcs.status AS session_status
+       FROM video_call_request vcr
+       LEFT JOIN LATERAL (
+         SELECT id, status
+         FROM video_call_session
+         WHERE request_id = vcr.id
+         ORDER BY created_at DESC
+         LIMIT 1
+       ) vcs ON TRUE
        WHERE target_creator_id = $1
        ORDER BY requested_at DESC
        LIMIT $2`,
@@ -4793,8 +5202,25 @@ v1.get('/calls/requests/outgoing', authRequired, async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT id, requester_user_id, target_creator_id, status, requested_at, responded_at, expires_at, decline_reason, metadata
-       FROM video_call_request
+      `SELECT vcr.id,
+              vcr.requester_user_id,
+              vcr.target_creator_id,
+              vcr.status,
+              vcr.requested_at,
+              vcr.responded_at,
+              vcr.expires_at,
+              vcr.decline_reason,
+              vcr.metadata,
+              vcs.id AS session_id,
+              vcs.status AS session_status
+       FROM video_call_request vcr
+       LEFT JOIN LATERAL (
+         SELECT id, status
+         FROM video_call_session
+         WHERE request_id = vcr.id
+         ORDER BY created_at DESC
+         LIMIT 1
+       ) vcs ON TRUE
        WHERE requester_user_id = $1
        ORDER BY requested_at DESC
        LIMIT $2`,
@@ -4822,6 +5248,7 @@ v1.post('/calls/:requestId/accept', authRequired, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const actor = await getCurrentUserProfile(req.auth.sub, client);
 
     const requestResult = await client.query(
       `SELECT vcr.id,
@@ -4925,7 +5352,24 @@ v1.post('/calls/:requestId/accept', authRequired, async (req, res) => {
       ]
     );
 
+    const requesterNotification = await createNotification({
+      userId: request.requester_user_id,
+      type: 'video_call',
+      title: 'Call request accepted',
+      body: `${actor?.display_name || actor?.username || 'Creator'} accepted your call request`,
+      deepLink: '/notifications',
+      payload: {
+        requestId: request.id,
+        callId: session.rows[0].id
+      },
+      client
+    });
+
     await client.query('COMMIT');
+    pushNotification(requesterNotification).catch((error) => {
+      // eslint-disable-next-line no-console
+      console.error(error.message);
+    });
 
     const payload = await getVideoCallSessionById(session.rows[0].id);
     if (payload?.call?.roomId) {
@@ -4954,6 +5398,7 @@ v1.post('/calls/:requestId/decline', authRequired, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const actor = await getCurrentUserProfile(req.auth.sub, client);
 
     const requestResult = await client.query(
       `SELECT vcr.id,
@@ -4991,7 +5436,24 @@ v1.post('/calls/:requestId/decline', authRequired, async (req, res) => {
       [requestId, declineReason]
     );
 
+    const requesterNotification = await createNotification({
+      userId: declined.rows[0].requester_user_id,
+      type: 'video_call',
+      title: 'Call request declined',
+      body: `${actor?.display_name || actor?.username || 'Creator'} declined your call request`,
+      deepLink: '/notifications',
+      payload: {
+        requestId,
+        declineReason
+      },
+      client
+    });
+
     await client.query('COMMIT');
+    pushNotification(requesterNotification).catch((error) => {
+      // eslint-disable-next-line no-console
+      console.error(error.message);
+    });
     return res.json({ request: declined.rows[0] });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -5057,6 +5519,7 @@ v1.post('/calls/:id/join', authRequired, async (req, res) => {
   let committed = false;
   try {
     await client.query('BEGIN');
+    const actor = await getCurrentUserProfile(req.auth.sub, client);
 
     const sessionResult = await client.query(
       `SELECT vcs.id,
@@ -5139,8 +5602,27 @@ v1.post('/calls/:id/join', authRequired, async (req, res) => {
       ]
     );
 
+    const notificationRecipientUserId = isCreator ? session.client_user_id : session.creator_user_id;
+    const joinNotification = await createNotification({
+      userId: notificationRecipientUserId,
+      type: 'video_call',
+      title: 'Call participant joined',
+      body: `${actor?.display_name || actor?.username || 'Participant'} joined the call`,
+      deepLink: isCreator ? '/notifications' : '/creator',
+      payload: {
+        callId: session.id,
+        participantUserId: req.auth.sub,
+        participantRole: isCreator ? 'creator' : 'client'
+      },
+      client
+    });
+
     await client.query('COMMIT');
     committed = true;
+    pushNotification(joinNotification).catch((error) => {
+      // eslint-disable-next-line no-console
+      console.error(error.message);
+    });
 
     const payload = await getVideoCallSessionById(session.id);
     const currentUser = await getCurrentUserProfile(req.auth.sub);
@@ -5285,6 +5767,7 @@ v1.post('/calls/:id/end', authRequired, async (req, res) => {
   let committed = false;
   try {
     await client.query('BEGIN');
+    const actor = await getCurrentUserProfile(req.auth.sub, client);
 
     const sessionResult = await client.query(
       `SELECT vcs.id,
@@ -5346,8 +5829,28 @@ v1.post('/calls/:id/end', authRequired, async (req, res) => {
       ]
     );
 
+    const otherParticipantUserId = session.client_user_id === req.auth.sub
+      ? session.creator_user_id
+      : session.client_user_id;
+    const endNotification = await createNotification({
+      userId: otherParticipantUserId,
+      type: 'video_call',
+      title: 'Call ended',
+      body: `${actor?.display_name || actor?.username || 'Participant'} ended the call`,
+      deepLink: otherParticipantUserId === session.creator_user_id ? '/creator' : '/notifications',
+      payload: {
+        callId: session.id,
+        endedByUserId: req.auth.sub
+      },
+      client
+    });
+
     await client.query('COMMIT');
     committed = true;
+    pushNotification(endNotification).catch((error) => {
+      // eslint-disable-next-line no-console
+      console.error(error.message);
+    });
 
     const payload = await getVideoCallSessionById(session.id);
     if (payload?.call?.roomId) {
@@ -5432,19 +5935,29 @@ v1.post('/streams/start', authRequired, async (req, res) => {
       [creator.id]
     );
     if (existingLive.rows.length > 0) {
-      await client.query('COMMIT');
-      committed = true;
-      const payload = await getLiveSessionById(existingLive.rows[0].id, req.auth.sub);
-      const currentUser = await getCurrentUserProfile(req.auth.sub);
-      const livekit = isLiveKitConfigured()
-        ? issueLiveKitSessionCredentials({
-            stream: payload.stream,
-            userId: req.auth.sub,
-            role: 'host',
-            displayName: currentUser?.display_name
-          })
-        : null;
-      return res.json({ stream: payload.stream, viewerAccess: payload.viewerAccess, alreadyLive: true, livekit });
+      const existingSessionId = existingLive.rows[0].id;
+      if (!(await hasLiveCreatorPresence(existingSessionId))) {
+        await endLiveSessionById(existingSessionId, {
+          client,
+          reason: 'creator_offline',
+          viewerUserId: req.auth.sub
+        });
+      } else {
+        await client.query('COMMIT');
+        committed = true;
+        await touchLiveCreatorPresence(existingSessionId, req.auth.sub);
+        const payload = await getLiveSessionById(existingSessionId, req.auth.sub);
+        const currentUser = await getCurrentUserProfile(req.auth.sub);
+        const livekit = isLiveKitConfigured()
+          ? issueLiveKitSessionCredentials({
+              stream: payload.stream,
+              userId: req.auth.sub,
+              role: 'host',
+              displayName: currentUser?.display_name
+            })
+          : null;
+        return res.json({ stream: payload.stream, viewerAccess: payload.viewerAccess, alreadyLive: true, livekit });
+      }
     }
 
     const room = await client.query(
@@ -5506,6 +6019,7 @@ v1.post('/streams/start', authRequired, async (req, res) => {
 
     await client.query('COMMIT');
     committed = true;
+    await touchLiveCreatorPresence(created.rows[0].id, req.auth.sub);
     const payload = await getLiveSessionById(created.rows[0].id, req.auth.sub);
     const currentUser = await getCurrentUserProfile(req.auth.sub);
     const livekit = isLiveKitConfigured()
@@ -5553,8 +6067,18 @@ v1.get('/streams/live', async (req, res) => {
        LIMIT 100`
     );
 
+    const presenceBySessionId = await getLiveCreatorPresenceMap(result.rows.map((row) => row.id));
+    const activeRows = [];
+    for (const row of result.rows) {
+      if (presenceBySessionId.get(row.id)) {
+        activeRows.push(row);
+        continue;
+      }
+      await endLiveSessionById(row.id, { reason: 'creator_offline' });
+    }
+
     return res.json({
-      streams: result.rows.map((row) => sanitizeLiveSession(row))
+      streams: activeRows.map((row) => sanitizeLiveSession(row))
     });
   } catch (error) {
     return res.status(500).json({ error: 'failed to fetch live sessions' });
@@ -5566,6 +6090,10 @@ v1.get('/streams/:id', async (req, res) => {
     const payload = await getLiveSessionById(req.params.id);
     if (!payload) {
       return res.status(404).json({ error: 'live session not found' });
+    }
+    if (payload.stream.status === 'live' && !(await hasLiveCreatorPresence(req.params.id))) {
+      const ended = await endLiveSessionById(req.params.id, { reason: 'creator_offline' });
+      return res.json({ stream: ended?.stream || null });
     }
     let stream = payload.stream;
     if (liveAggregateDelegate) {
@@ -5597,6 +6125,13 @@ v1.post('/streams/:id/token', authRequired, async (req, res) => {
     if (!payload) {
       return res.status(404).json({ error: 'live session not found' });
     }
+    if (payload.stream.status === 'live' && !(await hasLiveCreatorPresence(req.params.id))) {
+      await endLiveSessionById(req.params.id, {
+        reason: 'creator_offline',
+        viewerUserId: req.auth.sub
+      });
+      return res.status(409).json({ error: 'live session is not active' });
+    }
     if (payload.stream.status !== 'live') {
       return res.status(409).json({ error: 'live session is not active' });
     }
@@ -5621,6 +6156,32 @@ v1.post('/streams/:id/token', authRequired, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({ error: 'failed to issue live session token' });
+  }
+});
+
+v1.post('/streams/:id/presence', authRequired, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT ls.id, ls.status
+       FROM live_session ls
+       INNER JOIN creator_profile cp
+         ON cp.id = ls.creator_id
+       WHERE ls.id = $1
+         AND cp.user_id = $2
+       LIMIT 1`,
+      [req.params.id, req.auth.sub]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'live session not found for current creator' });
+    }
+    if (result.rows[0].status !== 'live') {
+      return res.status(409).json({ error: 'live session is not active' });
+    }
+
+    await touchLiveCreatorPresence(req.params.id, req.auth.sub);
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(500).json({ error: 'failed to update creator live presence' });
   }
 });
 
@@ -5657,10 +6218,21 @@ v1.post('/streams/:id/join', authRequired, async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(409).json({ error: 'live session is not active' });
     }
+    if (!(await hasLiveCreatorPresence(session.id))) {
+      await endLiveSessionById(session.id, {
+        client,
+        reason: 'creator_offline',
+        viewerUserId: req.auth.sub
+      });
+      await client.query('COMMIT');
+      committed = true;
+      return res.status(409).json({ error: 'live session is not active' });
+    }
 
     if (session.creator_user_id === req.auth.sub) {
       await client.query('COMMIT');
       committed = true;
+      await touchLiveCreatorPresence(session.id, req.auth.sub);
       const payload = await getLiveSessionById(session.id, req.auth.sub);
       const currentUser = await getCurrentUserProfile(req.auth.sub);
       const livekit = isLiveKitConfigured()
@@ -5827,6 +6399,16 @@ v1.post('/streams/:id/extend', authRequired, async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(409).json({ error: 'live session is not active' });
     }
+    if (!(await hasLiveCreatorPresence(session.id))) {
+      await endLiveSessionById(session.id, {
+        client,
+        reason: 'creator_offline',
+        viewerUserId: req.auth.sub
+      });
+      await client.query('COMMIT');
+      committed = true;
+      return res.status(409).json({ error: 'live session is not active' });
+    }
     if (!session.viewer_id || !session.is_active) {
       await client.query('ROLLBACK');
       return res.status(409).json({ error: 'viewer must join live session before extending' });
@@ -5912,49 +6494,28 @@ v1.post('/streams/:id/end', authRequired, async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'live session not found for current creator' });
     }
-
-    await client.query(
-      `UPDATE live_session
-       SET status = 'ended',
-           ended_at = COALESCE(ended_at, now()),
-           updated_at = now()
-       WHERE id = $1`,
-      [req.params.id]
-    );
-
-    await client.query(
-      `UPDATE live_session_viewer
-       SET is_active = FALSE,
-           left_at = COALESCE(left_at, now())
-       WHERE live_session_id = $1
-         AND is_active = TRUE`,
-      [req.params.id]
-    );
-
-    if (sessionResult.rows[0].room_id) {
-      await client.query(
-        `UPDATE chat_room
-         SET is_active = FALSE,
-             updated_at = now()
-         WHERE id = $1`,
-        [sessionResult.rows[0].room_id]
-      );
-    }
+    const ended = await endLiveSessionById(req.params.id, {
+      client,
+      reason: 'creator_ended',
+      viewerUserId: req.auth.sub
+    });
 
     await client.query('COMMIT');
     committed = true;
-
-    const payload = await getLiveSessionById(req.params.id, req.auth.sub);
-    if (sessionResult.rows[0].room_id) {
-      publishChatEvent(sessionResult.rows[0].room_id, 'live.ended', {
-        liveSessionId: req.params.id
-      }).catch((error) => {
-        // eslint-disable-next-line no-console
-        console.error(error.message);
-      });
+    if (ended?.transitioned) {
+      await clearLiveCreatorPresence(req.params.id);
+      if (ended.roomId) {
+        publishChatEvent(ended.roomId, 'live.ended', {
+          liveSessionId: req.params.id,
+          reason: 'creator_ended'
+        }).catch((error) => {
+          // eslint-disable-next-line no-console
+          console.error(error.message);
+        });
+      }
     }
 
-    return res.json({ stream: payload?.stream || null });
+    return res.json({ stream: ended?.stream || null });
   } catch (error) {
     if (!committed) {
       await client.query('ROLLBACK');

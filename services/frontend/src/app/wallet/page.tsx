@@ -114,7 +114,7 @@ export default function WalletPage() {
           <h1 className="m-0">Wallet</h1>
           <p className="mt-1 text-sm text-muted">Deposit credits, tip creators, or subscribe from your balance.</p>
         </div>
-        <Link href="/feed/creators" className="text-sm font-bold text-accent underline">
+        <Link href="/creators" className="text-sm font-bold text-accent underline">
           Discover creators
         </Link>
       </div>

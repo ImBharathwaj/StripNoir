@@ -3,7 +3,7 @@ const nextConfig = {
   reactStrictMode: false,
   poweredByHeader: false,
   // Avoid local `.next/` permission issues when previous builds were run as root.
-  distDir: 'next-build-user-f3',
+  distDir: 'next-build-user',
   images: {
     remotePatterns: [
       { protocol: 'http', hostname: 'localhost', pathname: '/**' },
@@ -16,4 +16,3 @@ const nextConfig = {
 };
 
 export default nextConfig;
-

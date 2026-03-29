@@ -421,7 +421,7 @@ func wsHandler(redisClient *redis.Client, jwtSecrets []string, dbPool *pgxpool.P
 					if err := json.Unmarshal([]byte(msg.Payload), &ce); err == nil && strings.HasPrefix(ce.EventType, "message.") {
 						var mp struct {
 							Message struct {
-								ID            string `json:"id"`
+								ID           string `json:"id"`
 								SenderUserID string `json:"sender_user_id"`
 							} `json:"message"`
 						}
@@ -604,7 +604,7 @@ func longPollEventsHandler(redisClient *redis.Client, jwtSecrets []string, dbPoo
 				if err := json.Unmarshal([]byte(msg.Payload), &ce); err == nil && strings.HasPrefix(ce.EventType, "message.") {
 					var mp struct {
 						Message struct {
-							ID            string `json:"id"`
+							ID           string `json:"id"`
 							SenderUserID string `json:"sender_user_id"`
 						} `json:"message"`
 					}
@@ -776,7 +776,9 @@ func main() {
 	mux.HandleFunc("/internal/notify/publish", notifyPublishHandler(redisClient, internalKey))
 
 	if dbPool != nil {
+		mux.HandleFunc("GET /internal/history/rooms/summary", listRoomSummaryHandler(dbPool, internalKey))
 		mux.HandleFunc("GET /internal/history/rooms/{roomId}/messages", listMessagesHandler(redisClient, dbPool, internalKey))
+		mux.HandleFunc("POST /internal/history/rooms/{roomId}/read", markRoomReadHandler(redisClient, dbPool, internalKey))
 		mux.HandleFunc("POST /internal/history/rooms/{roomId}/messages", postMessageHandler(redisClient, dbPool, internalKey))
 		mux.HandleFunc("PATCH /internal/history/rooms/{roomId}/messages/{messageId}", patchMessageHandler(redisClient, dbPool, internalKey))
 		mux.HandleFunc("DELETE /internal/history/rooms/{roomId}/messages/{messageId}", deleteMessageHandler(redisClient, dbPool, internalKey))

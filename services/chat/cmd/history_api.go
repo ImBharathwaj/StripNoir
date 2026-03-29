@@ -188,6 +188,251 @@ func nullIfEmpty(s string) any {
 	return s
 }
 
+func listRoomSummaryHandler(pool *pgxpool.Pool, internalKey string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		userID, ok := requireInternalHistoryAccess(w, r, internalKey)
+		if !ok {
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+
+		rows, err := pool.Query(ctx, `
+			SELECT cr.id::text,
+			       cr.room_type,
+			       cr.subject,
+			       cr.created_at,
+			       cr.updated_at,
+			       other.user_id::text AS other_participant_user_id,
+			       ua.username AS other_participant_username,
+			       ua.display_name AS other_participant_display_name,
+			       ua.avatar_url AS other_participant_avatar_url,
+			       lm.id::text AS last_message_id,
+			       lm.sender_user_id::text AS last_message_sender_user_id,
+			       lm.body AS last_message_body,
+			       lm.status AS last_message_status,
+			       lm.sent_at AS last_message_sent_at,
+			       lm.edited_at AS last_message_edited_at,
+			       lm.deleted_at AS last_message_deleted_at,
+			       COALESCE(uc.unread_count, 0)::int AS unread_count
+			FROM chat_room cr
+			INNER JOIN chat_room_participant me
+			  ON me.room_id = cr.id
+			 AND me.user_id = $1::uuid
+			 AND me.left_at IS NULL
+			LEFT JOIN LATERAL (
+			  SELECT p.user_id
+			  FROM chat_room_participant p
+			  WHERE p.room_id = cr.id
+			    AND p.user_id <> $1::uuid
+			    AND p.left_at IS NULL
+			  ORDER BY p.joined_at ASC
+			  LIMIT 1
+			) other ON TRUE
+			LEFT JOIN user_account ua
+			  ON ua.id = other.user_id
+			LEFT JOIN LATERAL (
+			  SELECT m.id, m.sender_user_id, m.body, m.status, m.sent_at, m.edited_at, m.deleted_at
+			  FROM message m
+			  WHERE m.room_id = cr.id
+			    AND m.context = 'direct'
+			  ORDER BY m.sent_at DESC
+			  LIMIT 1
+			) lm ON TRUE
+			LEFT JOIN LATERAL (
+			  SELECT COUNT(*)::int AS unread_count
+			  FROM message m2
+			  LEFT JOIN chat_room_read_state rs
+			    ON rs.room_id = cr.id
+			   AND rs.user_id = $1::uuid
+			  WHERE m2.room_id = cr.id
+			    AND m2.context = 'direct'
+			    AND m2.sender_user_id <> $1::uuid
+			    AND (
+			      rs.last_read_at IS NULL
+			      OR m2.sent_at > rs.last_read_at
+			    )
+			) uc ON TRUE
+			WHERE cr.is_active = TRUE
+			ORDER BY COALESCE(lm.sent_at, cr.updated_at, cr.created_at) DESC
+			LIMIT 100`, userID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to fetch chat room summary"})
+			return
+		}
+		defer rows.Close()
+
+		rooms := make([]map[string]any, 0)
+		for rows.Next() {
+			var roomID, roomType string
+			var subject *string
+			var createdAt, updatedAt *time.Time
+			var otherUserID, otherUsername, otherDisplayName, otherAvatarURL *string
+			var lastMessageID, lastSenderUserID, lastMessageBody, lastMessageStatus *string
+			var lastSentAt, lastEditedAt, lastDeletedAt *time.Time
+			var unreadCount int
+			if err := rows.Scan(
+				&roomID,
+				&roomType,
+				&subject,
+				&createdAt,
+				&updatedAt,
+				&otherUserID,
+				&otherUsername,
+				&otherDisplayName,
+				&otherAvatarURL,
+				&lastMessageID,
+				&lastSenderUserID,
+				&lastMessageBody,
+				&lastMessageStatus,
+				&lastSentAt,
+				&lastEditedAt,
+				&lastDeletedAt,
+				&unreadCount,
+			); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to scan chat room summary"})
+				return
+			}
+
+			room := map[string]any{
+				"id":          roomID,
+				"roomType":    roomType,
+				"subject":     subject,
+				"createdAt":   createdAt,
+				"updatedAt":   updatedAt,
+				"unreadCount": unreadCount,
+			}
+			if otherUserID != nil && strings.TrimSpace(*otherUserID) != "" {
+				room["otherParticipant"] = map[string]any{
+					"userId":      *otherUserID,
+					"username":    otherUsername,
+					"displayName": otherDisplayName,
+					"avatarUrl":   otherAvatarURL,
+				}
+			} else {
+				room["otherParticipant"] = nil
+			}
+			if lastMessageID != nil && strings.TrimSpace(*lastMessageID) != "" {
+				room["lastMessage"] = map[string]any{
+					"id":           *lastMessageID,
+					"senderUserId": lastSenderUserID,
+					"body":         lastMessageBody,
+					"status":       lastMessageStatus,
+					"sentAt":       lastSentAt,
+					"editedAt":     lastEditedAt,
+					"deletedAt":    lastDeletedAt,
+				}
+			} else {
+				room["lastMessage"] = nil
+			}
+			rooms = append(rooms, room)
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{"rooms": rooms})
+	}
+}
+
+func markRoomReadHandler(redisClient *redis.Client, pool *pgxpool.Pool, internalKey string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		userID, ok := requireInternalHistoryAccess(w, r, internalKey)
+		if !ok {
+			return
+		}
+		roomID := r.PathValue("roomId")
+		var body struct {
+			LastReadMessageID string `json:"lastReadMessageId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err.Error() != "EOF" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+			return
+		}
+		lastReadMessageID := strings.TrimSpace(body.LastReadMessageID)
+
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+
+		part, err := confirmParticipant(ctx, pool, roomID, userID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to verify membership"})
+			return
+		}
+		if !part {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "not a participant of this room"})
+			return
+		}
+
+		if lastReadMessageID != "" {
+			var exists bool
+			err = pool.QueryRow(ctx, `
+				SELECT EXISTS(
+					SELECT 1
+					FROM message
+					WHERE id = $1::uuid
+					  AND room_id = $2::uuid
+					LIMIT 1
+				)`, lastReadMessageID, roomID).Scan(&exists)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to validate lastReadMessageId"})
+				return
+			}
+			if !exists {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "lastReadMessageId does not belong to this room"})
+				return
+			}
+		}
+
+		var readRoomID, readUserID string
+		var readMessageID *string
+		var lastReadAt, updatedAt *time.Time
+		err = pool.QueryRow(ctx, `
+			INSERT INTO chat_room_read_state (room_id, user_id, last_read_message_id, last_read_at)
+			VALUES ($1::uuid, $2::uuid, $3::uuid, now())
+			ON CONFLICT (room_id, user_id)
+			DO UPDATE SET
+			  last_read_message_id = EXCLUDED.last_read_message_id,
+			  last_read_at = EXCLUDED.last_read_at,
+			  updated_at = now()
+			RETURNING room_id::text, user_id::text, last_read_message_id::text, last_read_at, updated_at`,
+			roomID, userID, nullIfEmpty(lastReadMessageID),
+		).Scan(&readRoomID, &readUserID, &readMessageID, &lastReadAt, &updatedAt)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update read state"})
+			return
+		}
+
+		payload, _ := json.Marshal(map[string]any{
+			"roomId":            roomID,
+			"userId":            userID,
+			"lastReadMessageId": readMessageID,
+			"lastReadAt":        lastReadAt,
+		})
+		pubCtx, pubCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer pubCancel()
+		if err := publishRoomChatEvent(pubCtx, redisClient, roomID, "room.read", payload); err != nil {
+			log.Printf("history publish room.read: %v", err)
+		}
+
+		writeJSON(w, http.StatusOK, map[string]any{
+			"readState": map[string]any{
+				"room_id":              readRoomID,
+				"user_id":              readUserID,
+				"last_read_message_id": readMessageID,
+				"last_read_at":         lastReadAt,
+				"updated_at":           updatedAt,
+			},
+		})
+	}
+}
+
 func postMessageHandler(redisClient *redis.Client, pool *pgxpool.Pool, internalKey string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
