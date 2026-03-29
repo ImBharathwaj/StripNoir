@@ -109,7 +109,8 @@ export async function apiGet<T = any>(path: string): Promise<T> {
   try {
     const p = requestJson(`/api/v1${path}`, {
       method: 'GET',
-      headers: { authorization: `Bearer ${tokens.accessToken}` }
+      headers: { authorization: `Bearer ${tokens.accessToken}` },
+      cache: 'no-store'
     })
       .finally(() => {
         inflightGet.delete(key);
@@ -122,14 +123,16 @@ export async function apiGet<T = any>(path: string): Promise<T> {
       const freshAccess = await refreshAccessToken(tokens.refreshToken);
       return await requestJson(`/api/v1${path}`, {
         method: 'GET',
-        headers: { authorization: `Bearer ${freshAccess}` }
+        headers: { authorization: `Bearer ${freshAccess}` },
+        cache: 'no-store'
       });
     }
     if (e?.status === 429 && typeof e?.retryAfterMs === 'number' && e.retryAfterMs > 0 && e.retryAfterMs <= 8000) {
       await sleep(e.retryAfterMs);
       return await requestJson(`/api/v1${path}`, {
         method: 'GET',
-        headers: { authorization: `Bearer ${tokens.accessToken}` }
+        headers: { authorization: `Bearer ${tokens.accessToken}` },
+        cache: 'no-store'
       });
     }
     throw e;
@@ -224,4 +227,3 @@ export async function apiPut<T = any>(path: string, body: any): Promise<T> {
     throw e;
   }
 }
-

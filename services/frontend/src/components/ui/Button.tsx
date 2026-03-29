@@ -19,9 +19,9 @@ export default function Button({
   }
 >) {
   const base =
-    'inline-flex items-center justify-center rounded-xl font-extrabold transition focus:outline-none focus:ring-2 focus:ring-accent/60 disabled:opacity-60 disabled:cursor-not-allowed';
+    'inline-flex max-w-full items-center justify-center rounded-xl font-extrabold text-center leading-tight transition focus:outline-none focus:ring-2 focus:ring-accent/60 disabled:cursor-not-allowed disabled:opacity-60';
 
-  const sizes = size === 'sm' ? 'h-9 px-3 text-sm' : 'h-10 px-4 text-sm';
+  const sizes = size === 'sm' ? 'min-h-9 px-3 py-2 text-sm' : 'min-h-10 px-4 py-2.5 text-sm';
 
   const variants: Record<Variant, string> = {
     primary: 'bg-accent text-white hover:bg-accent/90',
@@ -36,4 +36,3 @@ export default function Button({
     </button>
   );
 }
-

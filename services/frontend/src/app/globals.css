@@ -35,11 +35,13 @@ html.light {
 html,
 body {
   height: 100%;
+  width: 100%;
 }
 
 body {
   background: rgb(var(--c-bg));
   color: rgb(var(--c-text));
+  overflow-x: hidden;
 }
 
 /* Premium defaults */
@@ -58,6 +60,26 @@ h2 {
 
 * {
   -webkit-tap-highlight-color: transparent;
+  box-sizing: border-box;
+}
+
+img,
+video,
+canvas,
+svg,
+iframe {
+  max-width: 100%;
+}
+
+input,
+textarea,
+select,
+button {
+  max-width: 100%;
+}
+
+#main-content > * {
+  min-width: 0;
 }
 
 /* Skip link: off-screen until keyboard focus */

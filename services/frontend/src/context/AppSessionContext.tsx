@@ -23,6 +23,7 @@ export type SessionCreatorProfile = {
   stageName: string;
   about?: string | null;
   categoryTags: string[];
+  isNsfw?: boolean;
   verificationStatus: string;
   defaultSubscriptionPriceCredits: number;
   liveEnabled?: boolean;

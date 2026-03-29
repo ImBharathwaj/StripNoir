@@ -5,11 +5,15 @@ import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { useAppSession } from "../../context/AppSessionContext";
 import { apiGet, apiPost, apiPut } from "../../lib/apiClient";
+import { subscribeNotifyWebSocket } from "../../lib/notifyWebSocketHub";
 import { loadTokens } from "../../lib/tokenStore";
 import { uploadUserMedia } from "../../lib/mediaUpload";
 import Button from "../../components/ui/Button";
 import Input from "../../components/ui/Input";
 import { Card, CardBody, CardHeader } from "../../components/ui/Card";
+import Badge from "../../components/ui/Badge";
+import ChatThreadPanel from "../../components/social/ChatThreadPanel";
+import VideoCallSessionPanel from "../../components/social/VideoCallSessionPanel";
 
 type ContentRow = {
   id: string;
@@ -21,6 +25,34 @@ type ContentRow = {
   unlockPriceCredits: number | null;
   publishedAt: string | null;
   createdAt: string | null;
+};
+
+type RoomSummary = {
+  id: string;
+  otherParticipant: {
+    userId: string;
+    username?: string | null;
+    displayName?: string | null;
+  } | null;
+  unreadCount: number;
+  lastMessage: {
+    sentAt?: string | null;
+    body?: string | null;
+    status?: string;
+  } | null;
+};
+
+type CallRequest = {
+  id: string;
+  requester_user_id: string;
+  target_creator_id: string;
+  status: string;
+  requested_at?: string;
+  responded_at?: string | null;
+  expires_at?: string | null;
+  decline_reason?: string | null;
+  session_id?: string | null;
+  session_status?: string | null;
 };
 
 function mediaKind(file: File): "image" | "video" | "audio" {
@@ -57,6 +89,16 @@ export default function CreatorStudioPage() {
   const [postBusy, setPostBusy] = useState(false);
   const [postMsg, setPostMsg] = useState<string | null>(null);
   const [postErr, setPostErr] = useState<string | null>(null);
+  const [rooms, setRooms] = useState<RoomSummary[]>([]);
+  const [roomsBusy, setRoomsBusy] = useState(false);
+  const [roomsErr, setRoomsErr] = useState<string | null>(null);
+  const [selectedRoomId, setSelectedRoomId] = useState<string | null>(null);
+  const [incomingRequests, setIncomingRequests] = useState<CallRequest[]>([]);
+  const [callsBusy, setCallsBusy] = useState(false);
+  const [callsErr, setCallsErr] = useState<string | null>(null);
+  const [selectedCallId, setSelectedCallId] = useState<string | null>(null);
+  const [acceptCreditsPerBlock, setAcceptCreditsPerBlock] = useState("1");
+  const [acceptBlockSeconds, setAcceptBlockSeconds] = useState("120");
 
   useEffect(() => {
     if (!loading && !user && !loadTokens()?.accessToken) {
@@ -89,6 +131,70 @@ export default function CreatorStudioPage() {
   useEffect(() => {
     if (isCreator && creatorProfile?.id) loadPosts();
   }, [isCreator, creatorProfile?.id, loadPosts]);
+
+  const loadConnections = useCallback(async () => {
+    if (!isCreator || !creatorProfile?.id) return;
+    setRoomsBusy(true);
+    setCallsBusy(true);
+    setRoomsErr(null);
+    setCallsErr(null);
+    try {
+      const [roomData, incomingData] = await Promise.all([
+        apiGet<{ rooms: RoomSummary[] }>("/chat/rooms/summary"),
+        apiGet<{ requests: CallRequest[] }>("/calls/requests/incoming?limit=30")
+      ]);
+      const nextRooms = roomData.rooms || [];
+      const nextRequests = incomingData.requests || [];
+      setRooms(nextRooms);
+      setIncomingRequests(nextRequests);
+      setSelectedRoomId((prev) => {
+        const unreadRoomId = nextRooms.find((room) => room.unreadCount > 0)?.id || null;
+        if (!prev) {
+          return unreadRoomId || nextRooms[0]?.id || null;
+        }
+        const stillExists = nextRooms.some((room) => room.id === prev);
+        if (!stillExists) {
+          return unreadRoomId || nextRooms[0]?.id || null;
+        }
+        const currentRoom = nextRooms.find((room) => room.id === prev) || null;
+        if (unreadRoomId && unreadRoomId !== prev && Number(currentRoom?.unreadCount || 0) === 0) {
+          return unreadRoomId;
+        }
+        return prev;
+      });
+      setSelectedCallId((prev) => prev || nextRequests.find((request) => request.session_id)?.session_id || null);
+    } catch (e: any) {
+      const message = e?.body?.error || e?.message || "failed to load creator inbox";
+      setRoomsErr(message);
+      setCallsErr(message);
+    } finally {
+      setRoomsBusy(false);
+      setCallsBusy(false);
+    }
+  }, [creatorProfile?.id, isCreator]);
+
+  useEffect(() => {
+    loadConnections();
+  }, [loadConnections]);
+
+  useEffect(() => {
+    if (!isCreator) return;
+    return subscribeNotifyWebSocket({
+      onMessage: (ev) => {
+        try {
+          const evt = JSON.parse(ev.data);
+          if (evt?.eventType !== "notification.created") return;
+          const type = String(evt?.payload?.notification?.type || "").toLowerCase();
+          if (!type.includes("message") && !type.includes("call") && !type.includes("follow") && !type.includes("sub")) {
+            return;
+          }
+          loadConnections();
+        } catch {
+          // ignore malformed notifications
+        }
+      }
+    });
+  }, [isCreator, loadConnections]);
 
   async function onSaveCreatorProfile(e: React.FormEvent) {
     e.preventDefault();
@@ -158,6 +264,36 @@ export default function CreatorStudioPage() {
     }
   }
 
+  async function onAcceptCall(requestId: string) {
+    setCallsBusy(true);
+    setCallsErr(null);
+    try {
+      const data = await apiPost<{ call?: { id?: string } }>(`/calls/${requestId}/accept`, {
+        creditsPerBlock: Math.max(1, parseInt(acceptCreditsPerBlock, 10) || 1),
+        blockDurationSeconds: Math.max(30, parseInt(acceptBlockSeconds, 10) || 120)
+      });
+      await loadConnections();
+      if (data?.call?.id) setSelectedCallId(data.call.id);
+    } catch (e: any) {
+      setCallsErr(e?.body?.error || e?.message || "failed to accept call");
+    } finally {
+      setCallsBusy(false);
+    }
+  }
+
+  async function onDeclineCall(requestId: string) {
+    setCallsBusy(true);
+    setCallsErr(null);
+    try {
+      await apiPost(`/calls/${requestId}/decline`, { reason: "declined" });
+      await loadConnections();
+    } catch (e: any) {
+      setCallsErr(e?.body?.error || e?.message || "failed to decline call");
+    } finally {
+      setCallsBusy(false);
+    }
+  }
+
   if (loading || (!user && loadTokens()?.accessToken)) {
     return (
       <div className="mx-auto max-w-3xl px-4 py-16 text-center text-muted">
@@ -188,7 +324,7 @@ export default function CreatorStudioPage() {
   }
 
   return (
-    <div className="mx-auto max-w-3xl space-y-8 px-4 py-8">
+    <div className="mx-auto max-w-6xl space-y-8 px-4 py-8 lg:px-6">
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <p className="text-[10px] font-bold uppercase tracking-wider text-accent">Creator</p>
@@ -199,6 +335,126 @@ export default function CreatorStudioPage() {
           Fan profile →
         </Link>
       </div>
+
+      <Card>
+        <CardHeader className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="m-0 text-sm font-black text-text">1:1 inbox</h2>
+            <p className="mt-1 text-xs text-muted">A cleaner live inbox for direct creator-user conversations.</p>
+          </div>
+          <Button type="button" variant="secondary" size="sm" onClick={() => loadConnections()} disabled={roomsBusy}>
+            Refresh
+          </Button>
+        </CardHeader>
+        <CardBody>
+          {roomsErr ? <p className="text-sm font-bold text-danger">{roomsErr}</p> : null}
+          <div className="grid gap-4 lg:grid-cols-[300px_minmax(0,1fr)]">
+            <div className="space-y-3">
+              {roomsBusy && rooms.length === 0 ? <p className="text-sm text-muted">Loading conversations...</p> : null}
+              {rooms.map((room) => (
+                <button
+                  key={room.id}
+                  type="button"
+                  onClick={() => setSelectedRoomId(room.id)}
+                  className={`w-full rounded-[20px] border p-4 text-left transition ${
+                    selectedRoomId === room.id
+                      ? "border-accent/50 bg-[linear-gradient(180deg,rgba(37,99,235,0.18),rgba(37,99,235,0.08))] shadow-[0_10px_30px_rgba(37,99,235,0.12)]"
+                      : "border-border bg-surface2/80 hover:bg-surface2"
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="truncate font-black text-text">
+                      {room.otherParticipant?.displayName || room.otherParticipant?.username || room.otherParticipant?.userId || "User"}
+                    </span>
+                    {room.unreadCount > 0 ? <Badge variant="warning">{room.unreadCount}</Badge> : <Badge>Read</Badge>}
+                  </div>
+                  <div className="mt-2 line-clamp-2 text-xs leading-5 text-muted">
+                    {room.lastMessage?.status === "deleted"
+                      ? "[deleted]"
+                      : room.lastMessage?.body || "No messages yet"}
+                  </div>
+                </button>
+              ))}
+              {!roomsBusy && rooms.length === 0 ? <p className="text-sm text-muted">No direct chats yet.</p> : null}
+            </div>
+
+            <div>
+              {selectedRoomId ? (
+                <ChatThreadPanel roomId={selectedRoomId} title="Selected 1:1 chat" subtitle="Only you and the user can access this thread." />
+              ) : (
+                <div className="rounded-xl border border-border bg-surface2 p-4 text-sm text-muted">Select a conversation to open the 1:1 chat.</div>
+              )}
+            </div>
+          </div>
+        </CardBody>
+      </Card>
+
+      <Card>
+        <CardHeader className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="m-0 text-sm font-black text-text">1:1 call requests</h2>
+            <p className="mt-1 text-xs text-muted">Call requests and active sessions now stay inside creator-user conversations.</p>
+          </div>
+          <Button type="button" variant="secondary" size="sm" onClick={() => loadConnections()} disabled={callsBusy}>
+            Refresh
+          </Button>
+        </CardHeader>
+        <CardBody className="space-y-4">
+          <div className="rounded-lg border border-border bg-surface2 p-3 text-sm text-muted">
+            <div className="font-bold text-text2">Accept pricing</div>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Input value={acceptCreditsPerBlock} onChange={(e) => setAcceptCreditsPerBlock(e.target.value)} type="number" min={1} className="w-28" />
+              <span className="self-center text-xs text-muted">credits / block</span>
+              <Input value={acceptBlockSeconds} onChange={(e) => setAcceptBlockSeconds(e.target.value)} type="number" min={30} className="w-28" />
+              <span className="self-center text-xs text-muted">seconds / block</span>
+            </div>
+          </div>
+
+          {callsErr ? <p className="text-sm font-bold text-danger">{callsErr}</p> : null}
+
+          <div className="grid gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
+            <div className="space-y-3">
+              {incomingRequests.map((request) => (
+                <div key={request.id} className="rounded-xl border border-border bg-surface2 p-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant={request.status === "accepted" ? "success" : "warning"}>{request.status}</Badge>
+                    {request.session_id ? <Badge>Session ready</Badge> : null}
+                  </div>
+                  <div className="mt-2 text-sm text-text">User {request.requester_user_id.slice(0, 8)}...</div>
+                  {request.expires_at ? <div className="mt-1 text-xs text-muted">Expires {new Date(request.expires_at).toLocaleString()}</div> : null}
+                  {request.decline_reason ? <div className="mt-1 text-xs text-danger">Declined: {request.decline_reason}</div> : null}
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {request.status === "requested" ? (
+                      <>
+                        <Button size="sm" onClick={() => onAcceptCall(request.id)} disabled={callsBusy}>
+                          Accept
+                        </Button>
+                        <Button size="sm" variant="secondary" onClick={() => onDeclineCall(request.id)} disabled={callsBusy}>
+                          Decline
+                        </Button>
+                      </>
+                    ) : null}
+                    {request.session_id ? (
+                      <Button size="sm" variant="secondary" onClick={() => setSelectedCallId(request.session_id || null)}>
+                        Open call
+                      </Button>
+                    ) : null}
+                  </div>
+                </div>
+              ))}
+              {!callsBusy && incomingRequests.length === 0 ? <p className="text-sm text-muted">No incoming call requests.</p> : null}
+            </div>
+
+            <div>
+              {selectedCallId ? (
+                <VideoCallSessionPanel callId={selectedCallId} onEnded={() => loadConnections()} />
+              ) : (
+                <div className="rounded-xl border border-border bg-surface2 p-4 text-sm text-muted">Accept or open a request to manage the 1:1 video call here.</div>
+              )}
+            </div>
+          </div>
+        </CardBody>
+      </Card>
 
       <Card>
         <CardHeader>

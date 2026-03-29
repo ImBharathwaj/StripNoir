@@ -40,7 +40,7 @@ export default function CreatorOnboardingPage() {
         videoCallEnabled
       });
 
-      router.replace('/feed/creators');
+      router.replace('/feed');
     } catch (err: any) {
       if (err?.status === 401 || err?.message === 'not authenticated') {
         router.replace('/login');
@@ -98,4 +98,3 @@ export default function CreatorOnboardingPage() {
     </div>
   );
 }
-

@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { apiGet, apiPost } from "../../../lib/apiClient";
+import { apiGet, apiPost, invalidateApiGetCache } from "../../../lib/apiClient";
 import { trackEvent } from "../../../lib/analytics";
 import { subscribeRoomWebSocket } from "../../../lib/roomWebSocketHub";
 import LiveKitViewer, { type LiveKitCredentials } from "../../../components/live/LiveKitViewer";
@@ -70,6 +70,7 @@ export default function LiveDetailPage() {
   const [watchExpiresAt, setWatchExpiresAt] = useState<string | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [extendBusy, setExtendBusy] = useState(false);
+  const [endBusy, setEndBusy] = useState(false);
 
   useEffect(() => {
     tickRef.current = setInterval(() => setNowMs(Date.now()), 1000);
@@ -78,32 +79,50 @@ export default function LiveDetailPage() {
     };
   }, []);
 
-  useEffect(() => {
-    let cancelled = false;
-    async function run() {
+  const loadStream = useCallback(async (cancelled = false, options?: { silent?: boolean }) => {
+    const silent = Boolean(options?.silent);
+    if (!silent && !stream) {
       setBusy(true);
       setError(null);
-      try {
-        const data = await apiGet<{ stream: LiveStream }>(`/streams/${encodeURIComponent(id)}`);
-        if (cancelled) return;
-        setStream(data.stream || null);
-        setActiveViewers(data.stream?.stats?.activeViewers ?? 0);
-      } catch (err: any) {
-        if (err?.status === 401 || err?.message === "not authenticated") {
-          router.replace("/login");
-          return;
-        }
-        if (!cancelled) setError(err?.body?.error || err?.message || "failed to load live session");
-      } finally {
-        if (!cancelled) setBusy(false);
-      }
     }
+    try {
+      const data = await apiGet<{ stream: LiveStream | null }>(`/streams/${encodeURIComponent(id)}`);
+      if (cancelled) return;
+      const nextStream = data.stream || null;
+      setStream(nextStream);
+      setActiveViewers(nextStream?.stats?.activeViewers ?? 0);
+      if (!nextStream || nextStream.status !== "live") {
+        setViewerJoined(false);
+        setIsHost(false);
+        setLivekit(null);
+        invalidateApiGetCache("/streams/live");
+      }
+    } catch (err: any) {
+      if (err?.status === 401 || err?.message === "not authenticated") {
+        router.replace("/login");
+        return;
+      }
+      if (!cancelled) setError(err?.body?.error || err?.message || "failed to load live session");
+    } finally {
+      if (!cancelled && !silent) setBusy(false);
+    }
+  }, [id, router, stream]);
 
-    if (id) run();
+  useEffect(() => {
+    let cancelled = false;
+    if (id) {
+      loadStream(cancelled);
+    }
+    const timer = setInterval(() => {
+      if (!cancelled && id) {
+        loadStream(cancelled, { silent: true });
+      }
+    }, 15000);
     return () => {
       cancelled = true;
+      clearInterval(timer);
     };
-  }, [id, router]);
+  }, [id, loadStream]);
 
   useEffect(() => {
     const roomId = stream?.roomId;
@@ -123,7 +142,13 @@ export default function LiveDetailPage() {
             const exp = p.watchExpiresAt ?? p.watch_expires_at;
             if (exp) setWatchExpiresAt(String(exp));
           } else if (t === "live.ended") {
-            setActiveViewers((v) => Math.max(0, v - 1));
+            setStream((current) => (current ? { ...current, status: "ended" } : current));
+            setViewerJoined(false);
+            setIsHost(false);
+            setLivekit(null);
+            setWatchExpiresAt(null);
+            setError("This live session has ended.");
+            invalidateApiGetCache("/streams/live");
           }
         } catch {
           // ignore malformed events
@@ -131,6 +156,39 @@ export default function LiveDetailPage() {
       }
     });
   }, [realtimeActive, stream?.roomId]);
+
+  useEffect(() => {
+    if (!isHost || !id || stream?.status !== "live") return;
+
+    let cancelled = false;
+    const sendPresence = async () => {
+      try {
+        await apiPost(`/streams/${encodeURIComponent(id)}/presence`, undefined);
+      } catch (err: any) {
+        if (cancelled) return;
+        if (err?.status === 401 || err?.message === "not authenticated") {
+          router.replace("/login");
+          return;
+        }
+        if (err?.status === 404 || err?.status === 409) {
+          setStream((current) => (current ? { ...current, status: "ended" } : current));
+          setIsHost(false);
+          setViewerJoined(false);
+          setLivekit(null);
+          setWatchExpiresAt(null);
+          setError("Your live session is no longer active.");
+          invalidateApiGetCache("/streams/live");
+        }
+      }
+    };
+
+    sendPresence();
+    const timer = setInterval(sendPresence, 10000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [id, isHost, router, stream?.status]);
 
   async function onJoin() {
     if (!id) return;
@@ -163,6 +221,12 @@ export default function LiveDetailPage() {
         setError("Insufficient credits to join. Add credits in your wallet and try again.");
         return;
       }
+      if (err?.status === 409) {
+        setError("This live session is no longer active.");
+        invalidateApiGetCache("/streams/live");
+        await loadStream(false, { silent: true });
+        return;
+      }
       setError(err?.body?.error || err?.message || "failed to join live session");
     } finally {
       setBusy(false);
@@ -186,9 +250,39 @@ export default function LiveDetailPage() {
         setError("Insufficient credits to extend. Deposit in wallet and try again.");
         return;
       }
+      if (err?.status === 409) {
+        setError("This live session is no longer active.");
+        invalidateApiGetCache("/streams/live");
+        await loadStream(false, { silent: true });
+        return;
+      }
       setError(err?.body?.error || err?.message || "failed to extend");
     } finally {
       setExtendBusy(false);
+    }
+  }
+
+  async function onEndSession() {
+    if (!id) return;
+    setEndBusy(true);
+    setError(null);
+    try {
+      const data = await apiPost<{ stream?: LiveStream | null }>(`/streams/${encodeURIComponent(id)}/end`, undefined);
+      setStream(data?.stream || null);
+      setViewerJoined(false);
+      setIsHost(false);
+      setLivekit(null);
+      setWatchExpiresAt(null);
+      invalidateApiGetCache("/streams/live");
+      router.replace("/live");
+    } catch (err: any) {
+      if (err?.status === 401 || err?.message === "not authenticated") {
+        router.replace("/login");
+        return;
+      }
+      setError(err?.body?.error || err?.message || "failed to end live session");
+    } finally {
+      setEndBusy(false);
     }
   }
 
@@ -257,13 +351,18 @@ export default function LiveDetailPage() {
                   <div className="flex flex-wrap gap-2">
                     <Button
                       onClick={onJoin}
-                      disabled={busy || viewerJoined || isHost}
+                      disabled={busy || viewerJoined || isHost || stream.status !== "live"}
                       variant="primary"
                       size="sm"
                     >
-                      {isHost ? "Hosting" : viewerJoined ? "Joined" : busy ? "Joining…" : "Join live"}
+                      {stream.status !== "live" ? "Session ended" : isHost ? "Hosting" : viewerJoined ? "Joined" : busy ? "Joining…" : "Join live"}
                     </Button>
-                    {!isHost && viewerJoined ? (
+                    {isHost ? (
+                      <Button onClick={onEndSession} disabled={endBusy} variant="secondary" size="sm">
+                        {endBusy ? "Ending…" : "End session"}
+                      </Button>
+                    ) : null}
+                    {!isHost && viewerJoined && stream.status === "live" ? (
                       <Button onClick={onExtend} disabled={extendBusy} variant="secondary" size="sm">
                         {extendBusy
                           ? "Extending…"
@@ -297,7 +396,7 @@ export default function LiveDetailPage() {
               />
             ) : !realtimeActive ? (
               <div className="rounded-xl border border-dashed border-border bg-surface2 p-6 text-center text-muted">
-                Join session to start watching.
+                {stream.status === "live" ? "Join session to start watching." : "This live session has ended."}
               </div>
             ) : null}
           </div>
